@@ -121,19 +121,46 @@ class CreateIssueTool(BaseTool):
             logger.info("tool=create_issue created #{}", result.get("number"))
             response = f"Created #{result['number']}: {result['title']}"
 
-            if self.neo4j_client and not assignee_id:
+            if not self.neo4j_client:
+                logger.debug("tool=create_issue suggestion skipped: no neo4j_client injected")
+            elif assignee_id:
+                logger.debug("tool=create_issue suggestion skipped: explicit assignee_id={}", assignee_id)
+            else:
                 try:
                     suggestions = await suggest_assignee(
                         self.neo4j_client, self.project_id, title, type
                     )
-                    if suggestions and suggestions[0]["score"] > 0:
+                    logger.debug(
+                        "tool=create_issue suggest_assignee returned {} candidates",
+                        len(suggestions),
+                    )
+                    if not suggestions:
+                        logger.info(
+                            "tool=create_issue no suggestion: empty result — "
+                            "graph may be empty, run POST /graph/sync"
+                        )
+                    elif suggestions[0]["score"] <= 0:
+                        logger.info(
+                            "tool=create_issue no suggestion: top score={:.1f} — "
+                            "not enough activity history yet (need resolved issues or comments)",
+                            suggestions[0]["score"],
+                        )
+                    else:
                         top = suggestions[0]
                         response += (
                             f"\n\U0001f4a1 Suggested assignee: {top['userName']}"
                             f" (based on past {type} issues)"
                         )
+                        logger.info(
+                            "tool=create_issue suggested user='{}' score={:.1f}",
+                            top["userName"], top["score"],
+                        )
                 except Exception as e:
-                    logger.warning("tool=create_issue suggestion failed: {}", e)
+                    logger.error(
+                        "tool=create_issue suggestion failed (neo4j error): {} — "
+                        "issue was still created successfully",
+                        e, exc_info=True,
+                    )
 
             return response
         except Exception as e:

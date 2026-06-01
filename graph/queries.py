@@ -42,6 +42,11 @@ async def suggest_assignee(
         {"project_id": project_id},
     )
 
+    logger.debug(
+        "suggest_assignee project={} type={} | resolved={} commented={} members={}",
+        project_id, issue_type, len(resolved), len(commented), len(load),
+    )
+
     scores: dict[str, float] = {}
     names:  dict[str, str]   = {}
 
@@ -64,6 +69,19 @@ async def suggest_assignee(
         key=lambda x: x["score"],
         reverse=True,
     )
+
+    if result:
+        logger.debug(
+            "suggest_assignee top candidates: {}",
+            [{"user": r["userName"], "score": r["score"]} for r in result[:3]],
+        )
+    else:
+        logger.info(
+            "suggest_assignee project={} type={}: no candidates — "
+            "no MEMBER_OF relationships in graph (run /graph/sync first)",
+            project_id, issue_type,
+        )
+
     logger.info("suggest_assignee project={} candidates={}", project_id, len(result))
     return result
 

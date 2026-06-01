@@ -141,6 +141,7 @@ async def full_sync(
     relationships_created = 0
 
     project_list: list = await node_api_client.get_projects(org_slug)
+    logger.info("full_sync org={} projects_found={}", org_slug, len(project_list))
 
     for project in project_list:
         await upsert_project(neo4j_client, project)
@@ -163,10 +164,17 @@ async def full_sync(
             if issue.get("sprintId"):
                 relationships_created += 1
 
+        logger.info(
+            "full_sync project='{}' members={} issues={} (assigned={} in_sprint={})",
+            project.get("name"),
+            len(members),
+            len(issues),
+            sum(1 for i in issues if i.get("assigneeId")),
+            sum(1 for i in issues if i.get("sprintId")),
+        )
+
     logger.info(
-        "full_sync org={} nodes={} rels={}",
-        org_slug,
-        nodes_created,
-        relationships_created,
+        "full_sync org={} done | nodes={} rels={}",
+        org_slug, nodes_created, relationships_created,
     )
     return {"nodes_created": nodes_created, "relationships_created": relationships_created}
