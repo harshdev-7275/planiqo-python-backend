@@ -33,11 +33,13 @@ _PROJECT = {"id": "proj-1", "name": "Alpha", "key": "ALP"}
 _ISSUE_FULL = {
     "id": "issue-1", "projectId": "proj-1", "number": 42, "title": "Fix login",
     "type": "bug", "priority": "high", "createdAt": "2026-06-01T00:00:00Z",
+    "completedAt": "2026-06-02T00:00:00Z",
     "assigneeId": "u1", "reporterId": "u2", "sprintId": "sprint-1",
 }
 _ISSUE_MINIMAL = {
     "id": "issue-2", "projectId": "proj-1", "number": 43, "title": "Add dark mode",
     "type": "task", "priority": "medium", "createdAt": "2026-06-01T00:00:00Z",
+    "completedAt": None,
     "assigneeId": None, "reporterId": "u2", "sprintId": None,
 }
 
@@ -111,6 +113,7 @@ async def test_upsert_issue_runs_merge_for_issue_node():
     assert params["title"] == "Fix login"
     assert params["type"] == "bug"
     assert params["priority"] == "high"
+    assert params["completedAt"] == "2026-06-02T00:00:00Z"
 
 
 @pytest.mark.asyncio

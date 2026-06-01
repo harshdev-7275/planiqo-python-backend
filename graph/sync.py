@@ -36,15 +36,16 @@ async def upsert_issue(neo4j_client, issue: dict) -> None:
         MERGE (i:Issue {id: $id})
         SET i.number = $number, i.title = $title,
             i.type = $type, i.priority = $priority,
-            i.createdAt = $createdAt
+            i.createdAt = $createdAt, i.completedAt = $completedAt
         """,
         {
-            "id":        issue["id"],
-            "number":    issue["number"],
-            "title":     issue["title"],
-            "type":      issue["type"],
-            "priority":  issue["priority"],
-            "createdAt": issue["createdAt"],
+            "id":          issue["id"],
+            "number":      issue["number"],
+            "title":       issue["title"],
+            "type":        issue["type"],
+            "priority":    issue["priority"],
+            "createdAt":   issue["createdAt"],
+            "completedAt": issue.get("completedAt"),
         },
     )
 
