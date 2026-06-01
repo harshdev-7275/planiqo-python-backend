@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     CLAUDE_MODEL: str = "claude-sonnet-4-20250514"
 
     # CORS — comma-separated origins allowed to call this service
-    CORS_ORIGINS: list[str] = ["http://localhost:5173"]
+    CORS_ORIGINS: list[str] = ["http://localhost:5173","https://ai-pm-frontend-gamma.vercel.app"]
 
     # Service auth
     INTERNAL_SECRET: str = "dev-secret"
