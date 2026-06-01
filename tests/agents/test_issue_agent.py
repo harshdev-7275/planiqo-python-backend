@@ -198,12 +198,23 @@ async def test_create_issue_suggestion_only_when_no_explicit_assignee():
 
 
 @pytest.mark.asyncio
-async def test_create_issue_no_suggestion_appended_when_score_zero():
+async def test_create_issue_uses_availability_message_when_score_zero():
     neo = MagicMock()
     with patch("tools.issue_tools.suggest_assignee", new=AsyncMock(return_value=_ZERO_SCORE)):
         tool = CreateIssueTool(api=_DEFAULT_API(), neo4j_client=neo, **CTX)
         result = await tool._arun(title="Login crash", type="bug")
-    assert "Harsh Singh" not in result
+    assert "Harsh Singh" in result
+    assert "available" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_create_issue_uses_history_message_when_score_positive():
+    neo = MagicMock()
+    with patch("tools.issue_tools.suggest_assignee", new=AsyncMock(return_value=_SUGGESTION)):
+        tool = CreateIssueTool(api=_DEFAULT_API(), neo4j_client=neo, **CTX)
+        result = await tool._arun(title="Login crash", type="bug")
+    assert "Harsh Singh" in result
+    assert "based on past bug issues" in result
 
 
 @pytest.mark.asyncio
@@ -245,12 +256,13 @@ async def test_suggest_assignee_tool_no_data_when_empty():
 
 
 @pytest.mark.asyncio
-async def test_suggest_assignee_tool_no_data_when_score_not_positive():
+async def test_suggest_assignee_tool_uses_availability_message_when_no_history():
     neo = MagicMock()
     with patch("tools.issue_tools.suggest_assignee", new=AsyncMock(return_value=_NEGATIVE_SCORE)):
         tool = SuggestAssigneeTool(neo4j_client=neo, **CTX)
         result = await tool._arun(title="fix login", type="bug")
-    assert "Harsh Singh" not in result
+    assert "Harsh Singh" in result
+    assert "available" in result.lower()
 
 
 @pytest.mark.asyncio

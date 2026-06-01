@@ -137,23 +137,21 @@ class CreateIssueTool(BaseTool):
                     if not suggestions:
                         logger.info(
                             "tool=create_issue no suggestion: empty result — "
-                            "graph may be empty, run POST /graph/sync"
-                        )
-                    elif suggestions[0]["score"] <= 0:
-                        logger.info(
-                            "tool=create_issue no suggestion: top score={:.1f} — "
-                            "not enough activity history yet (need resolved issues or comments)",
-                            suggestions[0]["score"],
+                            "no project members in graph, run POST /graph/sync"
                         )
                     else:
                         top = suggestions[0]
+                        reason = (
+                            f"based on past {type} issues"
+                            if top["score"] > 0
+                            else "most available team member"
+                        )
                         response += (
-                            f"\n\U0001f4a1 Suggested assignee: {top['userName']}"
-                            f" (based on past {type} issues)"
+                            f"\n\U0001f4a1 Suggested assignee: {top['userName']} ({reason})"
                         )
                         logger.info(
-                            "tool=create_issue suggested user='{}' score={:.1f}",
-                            top["userName"], top["score"],
+                            "tool=create_issue suggested user='{}' score={:.1f} reason='{}'",
+                            top["userName"], top["score"], reason,
                         )
                 except Exception as e:
                     logger.error(
@@ -189,12 +187,17 @@ class SuggestAssigneeTool(BaseTool):
         logger.info("tool=suggest_assignee title='{}' type={}", title, type)
         try:
             suggestions = await suggest_assignee(self.neo4j_client, self.project_id, title, type)
-            if not suggestions or suggestions[0]["score"] <= 0:
-                return "No suggestion available — not enough activity data yet."
+            if not suggestions:
+                return "No suggestion available — no project members found in graph (run /graph/sync)."
             top = suggestions[0]
+            if top["score"] > 0:
+                return (
+                    f"Suggested assignee: {top['userName']}"
+                    f" (score: {top['score']:.0f}, based on past {type} issues)"
+                )
             return (
                 f"Suggested assignee: {top['userName']}"
-                f" (score: {top['score']:.0f}, based on past {type} issues)"
+                f" (most available team member)"
             )
         except Exception as e:
             logger.error("tool=suggest_assignee failed: {}", e)
