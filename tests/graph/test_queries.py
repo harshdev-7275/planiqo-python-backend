@@ -25,9 +25,10 @@ async def test_suggest_assignee_runs_three_queries():
 @pytest.mark.asyncio
 async def test_suggest_assignee_returns_sorted_by_score_desc():
     neo = _neo4j(
-        [{"userId": "u1", "cnt": 1}, {"userId": "u2", "cnt": 3}],  # resolved
-        [],                                                           # comments
-        [{"userId": "u1", "open_count": 0}, {"userId": "u2", "open_count": 0}],  # load
+        [{"userId": "u1", "cnt": 1}, {"userId": "u2", "cnt": 3}],
+        [],
+        [{"userId": "u1", "userName": "Alice", "open_count": 0},
+         {"userId": "u2", "userName": "Bob",   "open_count": 0}],
     )
     results = await suggest_assignee(neo, "proj-1", "fix login", "bug")
     assert results[0]["userId"] == "u2"   # 3 resolved × 3 = score 9
@@ -37,9 +38,9 @@ async def test_suggest_assignee_returns_sorted_by_score_desc():
 @pytest.mark.asyncio
 async def test_suggest_assignee_resolved_weight_is_three():
     neo = _neo4j(
-        [{"userId": "u1", "cnt": 2}],   # resolved
-        [],                              # comments
-        [{"userId": "u1", "open_count": 0}],
+        [{"userId": "u1", "cnt": 2}],
+        [],
+        [{"userId": "u1", "userName": "Alice", "open_count": 0}],
     )
     results = await suggest_assignee(neo, "proj-1", "title", "bug")
     assert results[0]["score"] == 6   # 2 × 3
@@ -48,9 +49,9 @@ async def test_suggest_assignee_resolved_weight_is_three():
 @pytest.mark.asyncio
 async def test_suggest_assignee_comments_add_to_score():
     neo = _neo4j(
-        [],                                    # resolved
-        [{"userId": "u1", "cnt": 4}],          # comments
-        [{"userId": "u1", "open_count": 0}],
+        [],
+        [{"userId": "u1", "cnt": 4}],
+        [{"userId": "u1", "userName": "Alice", "open_count": 0}],
     )
     results = await suggest_assignee(neo, "proj-1", "title", "bug")
     assert results[0]["score"] == 4
@@ -59,9 +60,9 @@ async def test_suggest_assignee_comments_add_to_score():
 @pytest.mark.asyncio
 async def test_suggest_assignee_open_issues_penalise_score():
     neo = _neo4j(
-        [{"userId": "u1", "cnt": 2}],   # resolved → score 6
+        [{"userId": "u1", "cnt": 2}],
         [],
-        [{"userId": "u1", "open_count": 3}],  # penalty -3 → final 3
+        [{"userId": "u1", "userName": "Alice", "open_count": 3}],  # penalty -3 → final 3
     )
     results = await suggest_assignee(neo, "proj-1", "title", "bug")
     assert results[0]["score"] == 3
@@ -73,12 +74,16 @@ async def test_suggest_assignee_load_query_includes_all_members():
     neo = _neo4j(
         [],
         [],
-        [{"userId": "u1", "open_count": 1}, {"userId": "u2", "open_count": 0}],
+        [{"userId": "u1", "userName": "Alice", "open_count": 1},
+         {"userId": "u2", "userName": "Bob",   "open_count": 0}],
     )
     results = await suggest_assignee(neo, "proj-1", "title", "bug")
-    user_ids = [r["userId"] for r in results]
+    user_ids  = [r["userId"]   for r in results]
+    user_names = [r["userName"] for r in results]
     assert "u1" in user_ids
     assert "u2" in user_ids
+    assert "Alice" in user_names
+    assert "Bob"   in user_names
 
 
 @pytest.mark.asyncio

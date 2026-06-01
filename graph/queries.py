@@ -37,12 +37,13 @@ async def suggest_assignee(
         MATCH (u:User)-[:MEMBER_OF]->(p:Project {id: $project_id})
         OPTIONAL MATCH (u)-[:ASSIGNED_TO]->(open:Issue)-[:IN_PROJECT]->(p)
         WHERE open.completedAt IS NULL
-        RETURN u.id AS userId, count(open) AS open_count
+        RETURN u.id AS userId, u.name AS userName, count(open) AS open_count
         """,
         {"project_id": project_id},
     )
 
     scores: dict[str, float] = {}
+    names:  dict[str, str]   = {}
 
     for row in resolved:
         scores[row["userId"]] = scores.get(row["userId"], 0.0) + row["cnt"] * 3
@@ -52,12 +53,14 @@ async def suggest_assignee(
 
     for row in load:
         user_id = row["userId"]
+        names[user_id] = row.get("userName") or user_id
         if user_id not in scores:
             scores[user_id] = 0.0
         scores[user_id] -= row["open_count"]
 
     result = sorted(
-        [{"userId": uid, "score": score} for uid, score in scores.items()],
+        [{"userId": uid, "userName": names.get(uid, uid), "score": score}
+         for uid, score in scores.items()],
         key=lambda x: x["score"],
         reverse=True,
     )

@@ -3,8 +3,16 @@ from loguru import logger
 
 from agents.state import SupervisorState
 from clients.llm_client import get_tool
+from clients.neo4j_client import neo4j_client
 from clients.node_api import node_api_client
-from tools.issue_tools import CreateIssueTool, GetIssuesTool, GetStatusesTool, UpdateIssueStatusTool
+from tools.issue_tools import (
+    CreateIssueTool,
+    FindSimilarIssuesTool,
+    GetIssuesTool,
+    GetStatusesTool,
+    SuggestAssigneeTool,
+    UpdateIssueStatusTool,
+)
 
 _SYSTEM = (
     "You are a project management assistant. "
@@ -15,12 +23,15 @@ _SYSTEM = (
 
 
 def _build_agent(org_slug: str, project_id: str, user_id: str | None):
-    ctx = {"api": node_api_client, "org_slug": org_slug, "project_id": project_id, "user_id": user_id}
+    api_ctx   = {"api": node_api_client, "org_slug": org_slug, "project_id": project_id, "user_id": user_id}
+    graph_ctx = {"neo4j_client": neo4j_client, "org_slug": org_slug, "project_id": project_id}
     tools = [
-        GetIssuesTool(**ctx),
-        GetStatusesTool(**ctx),
-        CreateIssueTool(**ctx),
-        UpdateIssueStatusTool(**ctx),
+        GetIssuesTool(**api_ctx),
+        GetStatusesTool(**api_ctx),
+        CreateIssueTool(**api_ctx, neo4j_client=neo4j_client),
+        UpdateIssueStatusTool(**api_ctx),
+        SuggestAssigneeTool(**graph_ctx),
+        FindSimilarIssuesTool(**graph_ctx),
     ]
     return create_react_agent(get_tool(), tools, prompt=_SYSTEM)
 

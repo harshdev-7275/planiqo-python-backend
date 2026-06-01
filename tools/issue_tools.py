@@ -4,6 +4,8 @@ from langchain.tools import BaseTool
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from graph.queries import find_similar_issues, suggest_assignee
+
 
 class _NoInput(BaseModel):
     pass
@@ -82,6 +84,7 @@ class CreateIssueTool(BaseTool):
     org_slug: str
     project_id: str
     user_id: str | None = None
+    neo4j_client: Any | None = None
 
     async def _arun(
         self,
@@ -116,10 +119,88 @@ class CreateIssueTool(BaseTool):
                 user_id=self.user_id,
             )
             logger.info("tool=create_issue created #{}", result.get("number"))
-            return f"Created #{result['number']}: {result['title']}"
+            response = f"Created #{result['number']}: {result['title']}"
+
+            if self.neo4j_client and not assignee_id:
+                try:
+                    suggestions = await suggest_assignee(
+                        self.neo4j_client, self.project_id, title, type
+                    )
+                    if suggestions and suggestions[0]["score"] > 0:
+                        top = suggestions[0]
+                        response += (
+                            f"\n\U0001f4a1 Suggested assignee: {top['userName']}"
+                            f" (based on past {type} issues)"
+                        )
+                except Exception as e:
+                    logger.warning("tool=create_issue suggestion failed: {}", e)
+
+            return response
         except Exception as e:
             logger.error("tool=create_issue failed: {}", e)
             return f"Failed to create issue: {e}"
+
+    def _run(self, **kwargs) -> str:
+        raise NotImplementedError("Use async")
+
+
+class _SuggestAssigneeInput(BaseModel):
+    title: str = Field(description="Issue title")
+    type: str = Field(default="task", description="task|bug|story|epic")
+
+
+class SuggestAssigneeTool(BaseTool):
+    name: str = "suggest_assignee"
+    description: str = "Suggest the best person to assign a new issue. Args: title, type(task/bug/story/epic)."
+    args_schema: type[BaseModel] = _SuggestAssigneeInput
+
+    neo4j_client: Any
+    org_slug: str
+    project_id: str
+
+    async def _arun(self, title: str, type: str = "task") -> str:
+        logger.info("tool=suggest_assignee title='{}' type={}", title, type)
+        try:
+            suggestions = await suggest_assignee(self.neo4j_client, self.project_id, title, type)
+            if not suggestions or suggestions[0]["score"] <= 0:
+                return "No suggestion available — not enough activity data yet."
+            top = suggestions[0]
+            return (
+                f"Suggested assignee: {top['userName']}"
+                f" (score: {top['score']:.0f}, based on past {type} issues)"
+            )
+        except Exception as e:
+            logger.error("tool=suggest_assignee failed: {}", e)
+            return f"Failed to suggest assignee: {e}"
+
+    def _run(self, **kwargs) -> str:
+        raise NotImplementedError("Use async")
+
+
+class _FindSimilarInput(BaseModel):
+    title: str = Field(description="Issue title to search for similar issues")
+
+
+class FindSimilarIssuesTool(BaseTool):
+    name: str = "find_similar_issues"
+    description: str = "Find issues similar to a given title. Args: title."
+    args_schema: type[BaseModel] = _FindSimilarInput
+
+    neo4j_client: Any
+    org_slug: str
+    project_id: str
+
+    async def _arun(self, title: str) -> str:
+        logger.info("tool=find_similar_issues title='{}'", title)
+        try:
+            similar = await find_similar_issues(self.neo4j_client, self.project_id, title)
+            if not similar:
+                return "No similar issues found."
+            lines = [f"#{s['number']}: {s['title']}" for s in similar]
+            return "Similar issues found:\n" + "\n".join(lines)
+        except Exception as e:
+            logger.error("tool=find_similar_issues failed: {}", e)
+            return f"Failed to find similar issues: {e}"
 
     def _run(self, **kwargs) -> str:
         raise NotImplementedError("Use async")
