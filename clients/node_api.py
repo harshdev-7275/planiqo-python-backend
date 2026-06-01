@@ -46,6 +46,12 @@ class NodeAPIClient:
     async def get_issues(self, org_slug: str, project_id: str) -> list:
         return await self.get(f"/bot/orgs/{org_slug}/projects/{project_id}/issues")
 
+    async def get_projects(self, org_slug: str) -> list:
+        return await self.get(f"/bot/orgs/{org_slug}/projects")
+
+    async def get_project_members(self, org_slug: str, project_id: str) -> list:
+        return await self.get(f"/bot/orgs/{org_slug}/projects/{project_id}/members")
+
     async def get_sprints(self, org_slug: str, project_id: str) -> list:
         return await self.get(f"/bot/orgs/{org_slug}/projects/{project_id}/sprints")
 
