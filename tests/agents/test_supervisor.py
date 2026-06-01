@@ -10,13 +10,14 @@ def _intent(intent: Intent) -> IntentResult:
     return IntentResult(intent=intent, confidence=0.95, entities={})
 
 
-_ISSUE_STUB = AsyncMock(return_value={"result": {"message": "stub"}})
+_AGENT_STUB = AsyncMock(return_value={"result": {"message": "stub"}})
 
 
 async def _run(message: str, intent: Intent) -> dict:
     with (
         patch("agents.supervisor.classify", new=AsyncMock(return_value=_intent(intent))),
-        patch("agents.issue_agent.run", new=_ISSUE_STUB),
+        patch("agents.issue_agent.run",  new=_AGENT_STUB),
+        patch("agents.sprint_agent.run", new=_AGENT_STUB),
     ):
         from agents.supervisor import run
         return await run(message=message, **BASE_ARGS)

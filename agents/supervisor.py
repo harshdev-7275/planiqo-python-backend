@@ -6,6 +6,7 @@ from agents.state import SupervisorState
 from chains.intent import classify
 from models.intents import Intent, IntentResult
 import agents.issue_agent as _issue_agent
+import agents.sprint_agent as _sprint_agent
 
 
 # --- nodes ---
@@ -38,15 +39,24 @@ def _placeholder(agent_name: str):
 
 def _route_intent(intent_result: IntentResult) -> str:
     match intent_result.intent:
-        case Intent.CREATE_ISSUE:  return "issue_agent"
-        case Intent.QUERY_ISSUES:  return "issue_agent"
-        case Intent.UPDATE_ISSUE:  return "issue_agent"
-        case Intent.QUERY_SPRINT:  return "sprint_agent"
-        case Intent.CREATE_SPRINT: return "sprint_agent"
-        case Intent.QUERY_MEMBER:  return "member_agent"
-        case Intent.SUMMARIZE:     return "summarize_agent"
-        case Intent.TEAMS_CONTEXT: return "teams_agent"
-        case _:                    return "handle_unknown"
+        case Intent.CREATE_ISSUE:
+            return "issue_agent"
+        case Intent.QUERY_ISSUES:
+            return "issue_agent"
+        case Intent.UPDATE_ISSUE:
+            return "issue_agent"
+        case Intent.QUERY_SPRINT:
+            return "sprint_agent"
+        case Intent.CREATE_SPRINT:
+            return "sprint_agent"
+        case Intent.QUERY_MEMBER:
+            return "member_agent"
+        case Intent.SUMMARIZE:
+            return "summarize_agent"
+        case Intent.TEAMS_CONTEXT:
+            return "teams_agent"
+        case _:
+            return "handle_unknown"
 
 
 def route(state: SupervisorState) -> str:
@@ -56,7 +66,6 @@ def route(state: SupervisorState) -> str:
 # --- graph ---
 
 _PLACEHOLDER_AGENTS = [
-    "sprint_agent",
     "member_agent",
     "summarize_agent",
     "teams_agent",
@@ -65,7 +74,8 @@ _PLACEHOLDER_AGENTS = [
 _builder = StateGraph(SupervisorState)
 _builder.add_node("classify_intent", classify_intent)
 _builder.add_node("handle_unknown", handle_unknown)
-_builder.add_node("issue_agent", _issue_agent.run)
+_builder.add_node("issue_agent",  _issue_agent.run)
+_builder.add_node("sprint_agent", _sprint_agent.run)
 
 for _name in _PLACEHOLDER_AGENTS:
     _builder.add_node(_name, _placeholder(_name))
@@ -73,7 +83,8 @@ for _name in _PLACEHOLDER_AGENTS:
 _builder.add_edge(START, "classify_intent")
 _builder.add_conditional_edges("classify_intent", route)
 
-_builder.add_edge("issue_agent", END)
+_builder.add_edge("issue_agent",  END)
+_builder.add_edge("sprint_agent", END)
 for _name in _PLACEHOLDER_AGENTS:
     _builder.add_edge(_name, END)
 

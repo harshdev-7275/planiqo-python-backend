@@ -49,6 +49,18 @@ class NodeAPIClient:
     async def get_sprints(self, org_slug: str, project_id: str) -> list:
         return await self.get(f"/bot/orgs/{org_slug}/projects/{project_id}/sprints")
 
+    async def get_active_sprint(self, org_slug: str, project_id: str) -> dict | None:
+        """Fetch sprints and return the active one, if any."""
+        sprint_list: list = await self.get_sprints(org_slug, project_id)
+        return next((s for s in sprint_list if s.get("status") == "active"), None)
+
+    async def add_issue_to_sprint(
+        self, org_slug: str, project_id: str, sprint_id: str, issue_id: str
+    ) -> dict:
+        return await self.post(
+            f"/bot/orgs/{org_slug}/projects/{project_id}/sprints/{sprint_id}/issues/{issue_id}"
+        )
+
     async def get_members(self, org_slug: str) -> list:
         return await self.get(f"/bot/orgs/{org_slug}/members")
 
