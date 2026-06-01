@@ -1,0 +1,83 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Type Checking
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Ruff / Lint
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Build / Distribution
+build/
+dist/
+*.egg-info/
+
+# UV
+uv.lock
+
+# Coverage
+.coverage.*
+coverage.xml
+
+# FastAPI
+*.db
+*.sqlite3
+
+# Secrets
+secrets.json
+credentials.json
+
+# Temporary Files
+tmp/
+temp/
+*.tmp
+
+# Node (if frontend exists)
+node_modules/
+
+# Claude
+.claude/
+
+# Local settings
+.python-version
