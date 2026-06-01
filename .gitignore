@@ -53,8 +53,6 @@ build/
 dist/
 *.egg-info/
 
-# UV
-uv.lock
 
 # Coverage
 .coverage.*
