@@ -1,5 +1,7 @@
 from enum import Enum
-from pydantic import BaseModel
+from typing import Any
+
+from pydantic import BaseModel, field_validator
 
 
 class Intent(str, Enum):
@@ -18,3 +20,11 @@ class IntentResult(BaseModel):
     intent: Intent
     confidence: float
     entities: dict
+
+    @field_validator("entities", mode="before")
+    @classmethod
+    def coerce_entities(cls, v: Any) -> dict:
+        # Some models return [{name: k, value: v}, ...] instead of {k: v}
+        if isinstance(v, list):
+            return {item["name"]: item["value"] for item in v if "name" in item}
+        return v if isinstance(v, dict) else {}

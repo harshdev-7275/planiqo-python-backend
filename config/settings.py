@@ -1,14 +1,46 @@
+from typing import Literal
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # Models
+    # Provider toggle — "groq" | "kimi" | "minimax"
+    AI_PROVIDER: Literal["groq", "kimi", "minimax"] = "groq"
+
+    # Groq
     GROQ_API_KEY: str = ""
-    ANTHROPIC_API_KEY: str = ""
     GROQ_FAST_MODEL: str = "llama-3.1-8b-instant"
     GROQ_LARGE_MODEL: str = "llama-3.3-70b-versatile"
     GROQ_TOOL_MODEL: str = "llama-3.3-70b-versatile"
+
+    # Kimi (Moonshot AI — OpenAI-compatible)
+    KIMI_API_KEY: str = ""
+    KIMI_BASE_URL: str = "https://api.moonshot.cn/v1"
+    KIMI_FAST_MODEL: str = "moonshot-v1-8k"
+    KIMI_LARGE_MODEL: str = "moonshot-v1-32k"
+    KIMI_TOOL_MODEL: str = "moonshot-v1-128k"
+
+    # MiniMax (OpenAI-compatible)
+    MINIMAX_API_KEY: str = ""
+    MINIMAX_BASE_URL: str = "https://api.minimax.io/v1"
+    MINIMAX_FAST_MODEL: str = "MiniMax-M2.5"
+    MINIMAX_LARGE_MODEL: str = "MiniMax-M3"
+    MINIMAX_TOOL_MODEL: str = "MiniMax-M2.7"
+
+    # Claude (kept for future option 2 routing)
+    ANTHROPIC_API_KEY: str = ""
     CLAUDE_MODEL: str = "claude-sonnet-4-20250514"
+
+    @model_validator(mode="after")
+    def _check_provider_key(self) -> "Settings":
+        if self.AI_PROVIDER == "groq" and not self.GROQ_API_KEY:
+            raise ValueError("GROQ_API_KEY is required when AI_PROVIDER=groq")
+        if self.AI_PROVIDER == "kimi" and not self.KIMI_API_KEY:
+            raise ValueError("KIMI_API_KEY is required when AI_PROVIDER=kimi")
+        if self.AI_PROVIDER == "minimax" and not self.MINIMAX_API_KEY:
+            raise ValueError("MINIMAX_API_KEY is required when AI_PROVIDER=minimax")
+        return self
 
     # CORS — comma-separated origins allowed to call this service
     CORS_ORIGINS: list[str] = ["http://localhost:5173","https://ai-pm-frontend-gamma.vercel.app"]
