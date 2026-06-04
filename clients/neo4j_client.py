@@ -1,3 +1,5 @@
+from typing import Any
+
 from neo4j import AsyncGraphDatabase, AsyncDriver
 from loguru import logger
 
@@ -25,7 +27,7 @@ class Neo4jClient:
             logger.warning("Neo4j ping failed: {}", e)
             return False
 
-    async def run(self, query: str, params: dict | None = None) -> list[dict]:
+    async def run(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         if self._driver is None:
             raise RuntimeError("Neo4j driver not initialised — call connect() first")
         async with self._driver.session() as session:

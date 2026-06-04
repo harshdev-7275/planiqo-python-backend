@@ -7,6 +7,7 @@ from tools.issue_tools import (
     GetIssuesTool,
     SuggestAssigneeTool,
     UpdateIssueStatusTool,
+    UpdateIssueTool,
 )
 
 CTX = {"org_slug": "acme", "project_id": "proj-1"}
@@ -161,6 +162,88 @@ async def test_update_issue_status_returns_error_string_on_failure():
     api = _mock_api(patch=AsyncMock(side_effect=Exception("404")))
     tool = UpdateIssueStatusTool(api=api, **CTX)
     result = await tool._arun(issue_id="issue-7", status_id="status-done")
+    assert "Failed" in result
+
+
+# --- UpdateIssueTool (priority / title / reassign by issue NUMBER) ---
+
+_UPD_ISSUES = [
+    {"number": 5, "id": "issue-uuid-5", "title": "Login broken", "priority": "low"},
+    {"number": 6, "id": "issue-uuid-6", "title": "Dark mode", "priority": "medium"},
+]
+
+
+@pytest.mark.asyncio
+async def test_update_issue_resolves_number_then_patches_priority():
+    api = _mock_api(
+        get_issues=AsyncMock(return_value=_UPD_ISSUES),
+        patch=AsyncMock(return_value={"number": 5, "title": "Login broken"}),
+    )
+    tool = UpdateIssueTool(api=api, org_slug="acme", project_id="proj-1", user_id="u-1")
+    await tool._arun(issue_number=5, priority="high")
+    api.patch.assert_called_once_with(
+        "/orgs/acme/projects/proj-1/issues/issue-uuid-5",
+        {"priority": "high"},
+        user_id="u-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_issue_sets_title_and_assignee():
+    api = _mock_api(
+        get_issues=AsyncMock(return_value=_UPD_ISSUES),
+        patch=AsyncMock(return_value={"number": 5, "title": "New title"}),
+    )
+    tool = UpdateIssueTool(api=api, **CTX)
+    await tool._arun(issue_number=5, title="New title", assignee_id="u-9")
+    _, body = api.patch.call_args[0]
+    assert body["title"] == "New title"
+    assert body["assigneeId"] == "u-9"  # camelCase for the backend schema
+
+
+@pytest.mark.asyncio
+async def test_update_issue_returns_confirmation_with_number():
+    api = _mock_api(
+        get_issues=AsyncMock(return_value=_UPD_ISSUES),
+        patch=AsyncMock(return_value={"number": 5, "title": "Login broken"}),
+    )
+    tool = UpdateIssueTool(api=api, **CTX)
+    result = await tool._arun(issue_number=5, priority="high")
+    assert "#5" in result
+
+
+@pytest.mark.asyncio
+async def test_update_issue_number_not_found_does_not_patch():
+    api = _mock_api(
+        get_issues=AsyncMock(return_value=_UPD_ISSUES),
+        patch=AsyncMock(return_value={}),
+    )
+    tool = UpdateIssueTool(api=api, **CTX)
+    result = await tool._arun(issue_number=99, priority="high")
+    assert "#99" in result and "not found" in result.lower()
+    api.patch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_issue_with_no_fields_does_not_patch():
+    api = _mock_api(
+        get_issues=AsyncMock(return_value=_UPD_ISSUES),
+        patch=AsyncMock(return_value={}),
+    )
+    tool = UpdateIssueTool(api=api, **CTX)
+    result = await tool._arun(issue_number=5)
+    assert "nothing" in result.lower()
+    api.patch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_issue_returns_error_string_on_failure():
+    api = _mock_api(
+        get_issues=AsyncMock(return_value=_UPD_ISSUES),
+        patch=AsyncMock(side_effect=Exception("403")),
+    )
+    tool = UpdateIssueTool(api=api, **CTX)
+    result = await tool._arun(issue_number=5, priority="high")
     assert "Failed" in result
 
 

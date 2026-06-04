@@ -1,12 +1,16 @@
+from typing import Any
+
 from loguru import logger
+
+from clients.neo4j_client import Neo4jClient
 
 
 async def suggest_assignee(
-    neo4j_client,
+    neo4j_client: Neo4jClient,
     project_id: str,
     issue_title: str,
     issue_type: str,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """
     Score each project member as a candidate assignee:
       +3 per resolved same-type issue they were assigned to
@@ -76,15 +80,12 @@ async def suggest_assignee(
     # Final filter: only active members. An ex-member who left the project
     # but has historical resolved-issue signal will have a positive score
     # above — drop them here.
-    result = sorted(
-        [
-            {"userId": uid, "userName": names.get(uid, uid), "score": score}
-            for uid, score in scores.items()
-            if uid in active_member_ids
-        ],
-        key=lambda x: x["score"],
-        reverse=True,
-    )
+    candidates: list[dict[str, Any]] = [
+        {"userId": uid, "userName": names.get(uid, uid), "score": score}
+        for uid, score in scores.items()
+        if uid in active_member_ids
+    ]
+    result = sorted(candidates, key=lambda x: x["score"], reverse=True)
 
     if result:
         logger.debug(
@@ -103,10 +104,10 @@ async def suggest_assignee(
 
 
 async def find_similar_issues(
-    neo4j_client,
+    neo4j_client: Neo4jClient,
     project_id: str,
     title: str,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """
     Find issues in the project whose title shares meaningful words with the given title.
     Words of 3 chars or fewer are ignored as noise. Returns up to 5 results sorted by
@@ -133,9 +134,9 @@ async def find_similar_issues(
 
 
 async def get_expertise_map(
-    neo4j_client,
+    neo4j_client: Neo4jClient,
     project_id: str,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """
     For each project member, return their activity counts:
     assigned issues, comments made, and field changes made.
@@ -158,10 +159,10 @@ async def get_expertise_map(
 
 
 async def find_user_by_name(
-    neo4j_client,
+    neo4j_client: Neo4jClient,
     project_id: str,
     name: str,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Resolve a human name to project member candidates.
 
     Case-insensitive substring match on name OR email — handles "Alice"

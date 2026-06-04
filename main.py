@@ -1,4 +1,6 @@
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,7 +29,7 @@ class SyncRequest(BaseModel):
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("AI service starting up")
     # Neo4j is optional infrastructure: the graph powers smart-assignee and
     # similarity, which already degrade gracefully per-call. If it is unreachable
@@ -61,7 +63,7 @@ app.add_middleware(InternalAuthMiddleware)
 
 
 @app.get("/health")
-async def health():
+async def health() -> dict[str, Any]:
     node_ok = await node_api_client.ping()
     neo4j_ok = await neo4j_client.ping()
     return {
@@ -72,7 +74,7 @@ async def health():
 
 
 @app.post("/graph/sync")
-async def graph_sync(body: SyncRequest) -> dict:
+async def graph_sync(body: SyncRequest) -> dict[str, int]:
     return await full_sync(
         neo4j_client=neo4j_client,
         node_api_client=node_api_client,
@@ -81,7 +83,7 @@ async def graph_sync(body: SyncRequest) -> dict:
 
 
 @app.get("/admin/usage/{org_slug}")
-async def admin_usage(org_slug: str) -> dict:
+async def admin_usage(org_slug: str) -> dict[str, Any]:
     """Per-org token usage + request count. Internal-only (the auth middleware
     blocks external callers; the frontend has no need to see this)."""
     return {
@@ -93,7 +95,7 @@ async def admin_usage(org_slug: str) -> dict:
 
 
 @app.post("/chat")
-async def chat(body: ChatRequest):
+async def chat(body: ChatRequest) -> dict[str, Any]:
     return await supervisor.run(
         message=body.message,
         user_id=body.user_id,

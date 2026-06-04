@@ -20,9 +20,12 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from loguru import logger
 
 import agents.issue_agent as _issue_agent
+import agents.member_agent as _member_agent
 import agents.sprint_agent as _sprint_agent
+import agents.summarize_agent as _summarize_agent
 from agents.state import SupervisorState
 from chains.intent import classify
+from chains.normalizer import normalize_entities
 from clients.neo4j_client import neo4j_client
 from clients.node_api import node_api_client
 from config.settings import settings
@@ -67,9 +70,18 @@ _AFFIRM_CORE: frozenset[str] = frozenset({
 _NEGATE_WORDS: frozenset[str] = frozenset({
     "no", "n", "nope", "cancel", "stop", "abort", "never", "mind", "nevermind",
     "dont", "don't",
+    # Contextual negations — common replies after the bot says "No X matching
+    # 'Y' found". The user means "yeah I see, cancel" without literally
+    # typing "no". "found" is in vocab but NOT in core: it can be a positive
+    # ("I found it"), so a single-token "found" must not match on its own.
+    "not", "found", "doesn't", "doesnt", "exist", "wrong", "missing",
+    "none", "those", "of", "one",
 })
 _NEGATE_CORE: frozenset[str] = frozenset({
     "no", "n", "nope", "cancel", "stop", "abort", "dont", "don't",
+    # The load-bearing words for contextual negations. "found" is
+    # deliberately NOT here — it can be positive ("I found the bug").
+    "not", "doesn't", "doesnt", "wrong", "none", "missing",
 })
 
 _UNKNOWN_MESSAGE = (
@@ -159,15 +171,93 @@ def _join_clauses(parts: list[str]) -> str:
     return ", ".join(parts[:-1]) + f", and {parts[-1]}"
 
 
+# Title cleaning for the preview. The LLM often copies the user's full verb
+# phrase ("Create a bug for the login page to Alice") into the title field;
+# the preview should show the issue's name, not the sentence the user typed.
+_LEADING_VERBS: frozenset[str] = frozenset({
+    "create", "add", "open", "file", "log", "make",
+    "raise", "submit", "track",
+})
+_DETERMINERS: frozenset[str] = frozenset({"a", "an", "the"})
+# Trailing prepositional phrases to strip — the assignee / sprint / project
+# meta the LLM copies from the user's full sentence. Word-level only, no
+# regex; we scan from the END so the rightmost preposition wins (avoids
+# eating "for checkout to Bob" when only "to Bob" is meta).
+_TRAILING_PREPOSITIONS: frozenset[str] = frozenset({
+    "for", "to", "in", "on", "at", "with", "by", "from", "of",
+})
+
+# If a trailing strip would leave the title shorter than this, restore the
+# original — the strip ate too much meaningful text.
+_MIN_TITLE_AFTER_STRIP = 8
+
+_MAX_TITLE_LEN = 200
+
+
+def _strip_trailing_prepositional_meta(text: str) -> str:
+    """Drop the last prepositional phrase at the end of ``text`` if it
+    would leave at least _MIN_TITLE_AFTER_STRIP chars. Scans from the end
+    so only the *rightmost* prepositional phrase is considered — the
+    leftmost-preposition regex would over-eat ("for checkout to Bob"
+    would all get stripped when only "to Bob" is meta)."""
+    words = text.split()
+    if len(words) < 2:
+        return text
+    for n in range(1, min(6, len(words))):
+        tail = " ".join(words[-n:])
+        if tail.split()[0].lower() in _TRAILING_PREPOSITIONS:
+            new_text = " ".join(words[:-n])
+            if len(new_text.strip()) >= _MIN_TITLE_AFTER_STRIP:
+                return new_text
+            return text  # strip would leave too little — restore
+    return text
+
+
+def _clean_title(raw: str | None) -> str:
+    """Clean an LLM-extracted issue title.
+
+    Two safe operations:
+      1. Drop a leading imperative verb + optional determiner
+         ("Create a …" → "…").
+      2. Drop the *last* prepositional phrase at the end of the string
+         ("to Alice", "in Sprint 1", "for the team") — only if at least
+         _MIN_TITLE_AFTER_STRIP chars remain after the strip.
+
+    Plus: collapse whitespace, strip trailing punctuation, cap at
+    _MAX_TITLE_LEN. Returns "" for empty/None input (the caller falls back
+    to a sentinel like "(untitled)").
+    """
+    if not raw:
+        return ""
+    text = raw.strip()
+    # 1. Leading verb + optional determiner.
+    parts = text.split(maxsplit=2)
+    if parts and parts[0].lower() in _LEADING_VERBS:
+        rest = parts[1:]
+        if rest and rest[0].lower() in _DETERMINERS:
+            rest = rest[1:]
+        text = " ".join(rest) if rest else ""
+    # 2. Trailing prepositional phrase (scans from end — see helper docstring).
+    text = _strip_trailing_prepositional_meta(text)
+    # 3. Collapse whitespace, strip trailing punctuation, cap length.
+    text = re.sub(r"\s+", " ", text).strip().rstrip(".,;:!?")
+    if len(text) > _MAX_TITLE_LEN:
+        text = text[:_MAX_TITLE_LEN].rstrip()
+    return text
+
+
 def _preview(intent_result: IntentResult) -> str:
     """A human-readable confirmation prompt built from the extracted entities.
     All extracted mutations are surfaced so the user is never silently agreeing
     to a side-effect they didn't read (e.g. an assignee they didn't mention)."""
     entities = intent_result.entities
     if intent_result.intent == Intent.CREATE_ISSUE:
-        title = entities.get("title") or entities.get("name") or "(untitled)"
-        issue_type = entities.get("type", "task")
-        priority = entities.get("priority", "medium")
+        title = _clean_title(entities.get("title") or entities.get("name")) or "(untitled)"
+        # The LLM may return `null` for fields it can't fill — fall through
+        # to defaults so the user never sees the literal Python ``None``
+        # in their proposal.
+        issue_type = entities.get("type") or "task"
+        priority = entities.get("priority") or "medium"
         parts = [f"create a {issue_type} titled '{title}' with {priority} priority"]
         # The LLM may emit either 'assignee' or 'assignee_id' depending on the
         # prompt / model; accept both.
@@ -217,11 +307,11 @@ def _looks_like_id(value: str | None) -> bool:
     return bool(value and _UUID_RE.match(value.strip()))
 
 
-def _coerce_member_name(m: dict) -> str:
+def _coerce_member_name(m: dict[str, Any]) -> str:
     return m.get("name") or m.get("userName") or m.get("userId") or "?"
 
 
-def _coerce_sprint_name(s: dict) -> str:
+def _coerce_sprint_name(s: dict[str, Any]) -> str:
     return s.get("name") or s.get("sprintName") or s.get("id") or "?"
 
 
@@ -268,7 +358,7 @@ async def _check_sprint_name(
         return None
     matches = [
         s for s in sprints
-        if name.lower() in (_coerce_sprint_name(s)).lower()
+        if _match_sprint_name(name, _coerce_sprint_name(s))
     ]
     if matches:
         return None
@@ -277,6 +367,55 @@ async def _check_sprint_name(
     if names:
         msg += f" Available sprints: {', '.join(names)}."
     return msg
+
+
+# Common sprint-name prefixes the user or the LLM may write that should
+# not influence the match: "Sprint 1" and "sprin1" both reduce to "1" once
+# the prefix is dropped, so "Sprint 1" resolves to a sprint actually named
+# "sprin1" — but "Sprint 99" still does NOT match "Sprint 1" (the suffixes
+# differ). Listed longest-first so "sprint " is tried before bare "sprint".
+_SPRINT_PREFIXES: tuple[str, ...] = (
+    "sprint ", "sprint-", "sprint_",
+    "sprint",
+    "sprin ", "sprin-", "sprin_",
+    "sprin",
+)
+
+
+def _strip_sprint_prefix(s: str) -> str:
+    for prefix in _SPRINT_PREFIXES:
+        if s.startswith(prefix):
+            return s[len(prefix):]
+    return s
+
+
+def _match_sprint_name(query: str, candidate: str) -> bool:
+    """True if ``query`` plausibly refers to ``candidate``.
+
+    Three-strategy ladder — strict enough to reject "Sprint 99" vs "Sprint 1"
+    (only the shared prefix matches) and lenient enough to accept
+    "Sprint 1" vs "sprin1" (both reduce to "1" once the sprint prefix is
+    dropped):
+
+      1. exact equality (lowercased, trimmed)
+      2. substring either way (handles "Sprint" → "Sprint Alpha")
+      3. strip the sprint prefix from both and re-check (handles the
+         "Sprint 1" → "sprin1" case; rejects "Sprint 99" → "Sprint 1" because
+         the suffixes differ)
+    """
+    q = (query or "").strip().lower()
+    c = (candidate or "").strip().lower()
+    if not q or not c:
+        return False
+    if q == c:
+        return True
+    if q in c or c in q:
+        return True
+    qs = _strip_sprint_prefix(q).strip()
+    cs = _strip_sprint_prefix(c).strip()
+    if qs and cs and (qs == cs or qs in cs or cs in qs):
+        return True
+    return False
 
 
 async def _check_issue_number(
@@ -382,9 +521,13 @@ async def _execute(
         out = await _issue_agent.run(state, callbacks=callbacks)
     elif target == "sprint_agent":
         out = await _sprint_agent.run(state, callbacks=callbacks)
+    elif target == "member_agent":
+        out = await _member_agent.run(state, callbacks=callbacks)
+    elif target == "summarize_agent":
+        out = await _summarize_agent.run(state, callbacks=callbacks)
     elif target == "handle_unknown":
         return {"message": _UNKNOWN_MESSAGE}
-    else:  # member_agent / summarize_agent / teams_agent — not built yet
+    else:  # teams_agent — not built yet
         return {"message": f"{target} not yet implemented"}
 
     result = out.get("result")
@@ -490,6 +633,13 @@ async def run(
         "supervisor intent={} confidence={:.2f}",
         intent_result.intent.value, intent_result.confidence,
     )
+
+    # 2a) Apply PM-domain conventions (a bug is high priority, "urgent" means
+    # critical, …) as a deterministic post-pass over the LLM's extraction.
+    # Done here, before validation/preview/pending, so the convention defaults
+    # are what the user confirms AND what is executed — no preview/execute drift.
+    if intent_result.intent == Intent.CREATE_ISSUE:
+        intent_result.entities = normalize_entities(message, intent_result.entities)
 
     # 2b) Pre-flight validation: for write intents, verify every entity the
     # user mentioned by NAME actually resolves. Failures short-circuit BEFORE

@@ -1,5 +1,7 @@
 from loguru import logger
 
+from clients.neo4j_client import Neo4jClient
+
 
 class NodeLabel:
     USER    = "User"
@@ -32,7 +34,7 @@ CONSTRAINTS: list[str] = [
 ]
 
 
-async def apply_constraints(neo4j_client) -> None:
+async def apply_constraints(neo4j_client: Neo4jClient) -> None:
     """Run all uniqueness constraints against Neo4j. Call once on startup."""
     for stmt in CONSTRAINTS:
         await neo4j_client.run(stmt)

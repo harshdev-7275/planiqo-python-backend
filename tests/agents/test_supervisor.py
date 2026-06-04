@@ -31,11 +31,15 @@ async def _run(
     response plus the issue/sprint agent stubs so callers can assert calls."""
     issue_stub = AsyncMock(return_value={"result": {"message": "issue-done"}})
     sprint_stub = AsyncMock(return_value={"result": {"message": "sprint-done"}})
+    member_stub = AsyncMock(return_value={"result": {"message": "member-done"}})
+    summarize_stub = AsyncMock(return_value={"result": {"message": "summary-done"}})
     args = {**BASE, **overrides}
     with (
         patch("agents.supervisor.classify", new=AsyncMock(return_value=_intent(intent))),
         patch("agents.issue_agent.run", new=issue_stub),
         patch("agents.sprint_agent.run", new=sprint_stub),
+        patch("agents.member_agent.run", new=member_stub),
+        patch("agents.summarize_agent.run", new=summarize_stub),
     ):
         from agents.supervisor import run
 
@@ -63,10 +67,26 @@ async def test_query_sprint_routes_to_sprint_agent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_query_member_is_placeholder() -> None:
-    result, _, _ = await _run("what is john working on", Intent.QUERY_MEMBER)
+async def test_query_member_routes_to_member_agent() -> None:
+    result, issue_stub, sprint_stub = await _run(
+        "what is john working on", Intent.QUERY_MEMBER
+    )
     assert result["intent"] == "QUERY_MEMBER"
-    assert "not yet implemented" in result["result"]["message"]
+    assert result["status"] == "executed"
+    assert result["result"]["message"] == "member-done"  # member_agent ran
+    # Reads route to exactly one agent.
+    issue_stub.assert_not_awaited()
+    sprint_stub.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_summarize_routes_to_summarize_agent() -> None:
+    result, issue_stub, sprint_stub = await _run("summarize sprint 2", Intent.SUMMARIZE)
+    assert result["intent"] == "SUMMARIZE"
+    assert result["status"] == "executed"
+    assert result["result"]["message"] == "summary-done"  # summarize_agent ran
+    issue_stub.assert_not_awaited()
+    sprint_stub.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -154,6 +174,58 @@ async def test_preview_includes_both_assignee_and_sprint() -> None:
     assert "Sprint 23" in msg
     # Grammar: must use 'and' to join the two side effects.
     assert "assign it to Alice, and put it in sprint Sprint 23" in msg
+
+
+@pytest.mark.asyncio
+async def test_preview_defaults_priority_and_type_when_entities_are_null() -> None:
+    """When the LLM returns `priority: null` / `type: null` (which the
+    classifier does — the JSON schema does not enforce non-null), the preview
+    must default to 'medium priority' / 'task' — never leak the literal
+    Python 'None' into user copy. Regression for the transcript bug where
+    the user saw 'with None priority' in the proposal."""
+    issue_stub = AsyncMock(return_value={"result": {"message": "should not run"}})
+    with (
+        patch(
+            "agents.supervisor.classify",
+            new=AsyncMock(return_value=_intent(
+                Intent.CREATE_ISSUE, title="Login broken", type=None, priority=None,
+            )),
+        ),
+        patch("agents.issue_agent.run", new=issue_stub),
+        patch("agents.sprint_agent.run", new=AsyncMock()),
+    ):
+        from agents.supervisor import run
+        # Message has no convention trigger word (no "bug"/"urgent"/…), so the
+        # null entities fall through to the plain medium/task defaults.
+        result = await run(message="create a login screen", **BASE)
+    msg = result["result"]["message"]
+    assert "medium priority" in msg, f"expected default 'medium' priority, got: {msg!r}"
+    assert "None" not in msg, f"preview must not leak 'None' to the user, got: {msg!r}"
+    assert "create a task titled" in msg, f"expected default 'task' type, got: {msg!r}"
+
+
+@pytest.mark.asyncio
+async def test_bug_convention_applied_through_supervisor() -> None:
+    """End-to-end: when the LLM returns null type/priority but the request
+    says 'bug', the convention normalizer fills type=bug + priority=high, and
+    that is what the preview proposes (and what would be executed on confirm)."""
+    issue_stub = AsyncMock(return_value={"result": {"message": "should not run"}})
+    with (
+        patch(
+            "agents.supervisor.classify",
+            new=AsyncMock(return_value=_intent(
+                Intent.CREATE_ISSUE, title="Login broken", type=None, priority=None,
+            )),
+        ),
+        patch("agents.issue_agent.run", new=issue_stub),
+        patch("agents.sprint_agent.run", new=AsyncMock()),
+    ):
+        from agents.supervisor import run
+        result = await run(message="create a bug for the login page", **BASE)
+    msg = result["result"]["message"]
+    assert "create a bug" in msg, f"expected type=bug, got: {msg!r}"
+    assert "high priority" in msg, f"expected priority=high, got: {msg!r}"
+    issue_stub.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -322,6 +394,14 @@ async def test_fresh_pending_still_confirms() -> None:
         # Negations.
         ("no, stop", True),
         ("nope cancel", True),
+        # Contextual negations — common replies after a validation failure
+        # where the bot said "No sprint matching 'X'…". The user is saying
+        # "yeah I see, cancel" without literally typing "no".
+        ("not found", True),
+        ("doesn't exist", True),
+        ("wrong one", True),
+        ("missing", True),
+        ("none of those", True),
         # Still works: exact set matches.
         ("yes", True),
         ("no", True),
@@ -370,6 +450,42 @@ async def test_unrelated_sentence_is_neither(message: str) -> None:
 
 
 # --- memory ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # Drop leading verb + optional determiner.
+        ("Create a bug", "bug"),
+        ("Add login button", "login button"),
+        ("File an issue", "issue"),
+        ("Log a thing", "thing"),
+        # Drop trailing prepositional meta.
+        ("Login page to Alice", "Login page"),
+        ("Bug for the login page to alice", "Bug for the login page"),
+        ("Issue in the dashboard", "Issue in the dashboard"),
+        # Drop leading AND trailing.
+        ("Create a login page to Alice", "login page"),
+        ("Add a bug for checkout to Bob", "bug for checkout"),
+        # No-change cases.
+        ("Login broken", "Login broken"),
+        ("Bug", "Bug"),
+        # Whitespace collapse + trailing punctuation.
+        ("  Make   a   thing  ", "thing"),
+        ("Login page,", "Login page"),
+        # Strip that would leave too little — restored.
+        ("Bug in", "Bug in"),
+        # Empty / None.
+        ("", ""),
+    ],
+)
+def test_clean_title(raw: str | None, expected: str) -> None:
+    """The preview uses a cleaned title so the user sees the issue name, not
+    the verb phrase. Regression for 'Create a bug for the login page to Alice'
+    producing a preview titled 'bug for the login page to Alice'."""
+    from agents.supervisor import _clean_title
+
+    assert _clean_title(raw) == expected
 
 
 @pytest.mark.asyncio

@@ -10,16 +10,12 @@ from loguru import logger
 from agents.state import SupervisorState
 from clients.llm_client import get_tool
 from clients.node_api import node_api_client
-from tools.sprint_tools import (
-    AddIssueToSprintTool,
-    CreateSprintTool,
-    GetActiveSprintTool,
-    GetSprintsTool,
-)
+from tools.member_tools import ListMembersTool, MemberIssuesTool
 
 _SYSTEM = (
     "You are a project management assistant. "
-    "Use tools to query sprints, create sprints, or add issues to sprints. "
+    "Use tools to answer questions about team members: list_members for who is "
+    "on the team, member_issues to see what a specific person is working on. "
     "Tools already know the project context — do not ask for org or project details. "
     "Be concise. Respond in plain text after tool calls complete."
 )
@@ -34,16 +30,11 @@ def _strip_think(text: str) -> str:
     return _THINK_RE.sub("", text).strip()
 
 
-def _build_agent(
-    org_slug: str, project_id: str, user_id: str | None
-) -> CompiledStateGraph[Any, None, Any, Any]:
+def _build_agent(org_slug: str, project_id: str) -> CompiledStateGraph[Any, None, Any, Any]:
     api = node_api_client
     tools = [
-        GetSprintsTool(api=api, org_slug=org_slug, project_id=project_id),
-        GetActiveSprintTool(api=api, org_slug=org_slug, project_id=project_id),
-        # Writes impersonate the acting user (X-Bot-User-Id) for authorization.
-        CreateSprintTool(api=api, org_slug=org_slug, project_id=project_id, user_id=user_id),
-        AddIssueToSprintTool(api=api, org_slug=org_slug, project_id=project_id),
+        ListMembersTool(api=api, org_slug=org_slug, project_id=project_id),
+        MemberIssuesTool(api=api, org_slug=org_slug, project_id=project_id),
     ]
     return create_react_agent(get_tool(), tools, prompt=_SYSTEM)
 
@@ -51,11 +42,10 @@ def _build_agent(
 async def run(state: SupervisorState, callbacks: Callbacks = None) -> dict[str, Any]:
     org_slug = state["org_slug"]
     project_id = state.get("project_id") or ""
-    user_id = state.get("user_id")
 
-    logger.info("sprint_agent org={} project={} user={}", org_slug, project_id, user_id)
+    logger.info("member_agent org={} project={}", org_slug, project_id)
 
-    agent = _build_agent(org_slug, project_id, user_id)
+    agent = _build_agent(org_slug, project_id)
     config: RunnableConfig | None = {"callbacks": callbacks} if callbacks else None
     response = await agent.ainvoke({"messages": state["messages"]}, config=config)
 
@@ -63,5 +53,5 @@ async def run(state: SupervisorState, callbacks: Callbacks = None) -> dict[str, 
     raw = last_message.content if hasattr(last_message, "content") else str(last_message)
     content = _strip_think(str(raw))
 
-    logger.info("sprint_agent response='{}'", content[:120])
+    logger.info("member_agent response='{}'", content[:120])
     return {"result": {"message": content}}

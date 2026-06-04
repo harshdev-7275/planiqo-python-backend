@@ -1,4 +1,4 @@
-from typing import Annotated, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph import add_messages
@@ -12,6 +12,6 @@ class SupervisorState(TypedDict):
     org_slug: str
     project_id: str | None
     intent: IntentResult | None
-    result: dict | None
+    result: dict[str, Any] | None
     error: str | None
     next: str

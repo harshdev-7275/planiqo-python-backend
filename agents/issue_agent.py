@@ -1,7 +1,9 @@
 import re
+from typing import Any
 
 from langchain_core.callbacks import Callbacks
 from langchain_core.runnables import RunnableConfig
+from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import create_react_agent
 from loguru import logger
 
@@ -17,6 +19,7 @@ from tools.issue_tools import (
     GetStatusesTool,
     SuggestAssigneeTool,
     UpdateIssueStatusTool,
+    UpdateIssueTool,
 )
 from tools.sprint_tools import AddIssueToSprintTool
 
@@ -24,10 +27,12 @@ _SYSTEM = (
     "You are a project management assistant. "
     "Use the provided tools to list, create, or update issues. "
     "Tools already know the project context — do not ask for org or project details. "
-    "Before calling create_issue with an assignee the user mentioned by NAME "
-    "(not a user ID), call find_user_by_name first to resolve the name to a "
-    "user ID. Never pass a display name as assignee_id — the backend stores it "
-    "as a literal string and the assignment silently breaks. "
+    "Before calling create_issue OR update_issue with an assignee the user "
+    "mentioned by NAME (not a user ID), call find_user_by_name first to resolve "
+    "the name to a user ID. Never pass a display name as assignee_id — the "
+    "backend stores it as a literal string and the assignment silently breaks. "
+    "To change an issue's priority, title, or assignee use update_issue with the "
+    "issue number (e.g. 5); use update_issue_status only for status changes. "
     "Be concise. Respond in plain text after tool calls complete."
 )
 
@@ -41,23 +46,29 @@ def _strip_think(text: str) -> str:
     return _THINK_RE.sub("", text).strip()
 
 
-def _build_agent(org_slug: str, project_id: str, user_id: str | None):
-    api_ctx   = {"api": node_api_client, "org_slug": org_slug, "project_id": project_id, "user_id": user_id}
-    graph_ctx = {"neo4j_client": neo4j_client, "org_slug": org_slug, "project_id": project_id}
+def _build_agent(
+    org_slug: str, project_id: str, user_id: str | None
+) -> CompiledStateGraph[Any, None, Any, Any]:
+    api = node_api_client
     tools = [
-        GetIssuesTool(**api_ctx),
-        GetStatusesTool(**api_ctx),
-        CreateIssueTool(**api_ctx, neo4j_client=neo4j_client),
-        UpdateIssueStatusTool(**api_ctx),
-        AddIssueToSprintTool(**api_ctx),  # lets the model fulfill the "in Sprint X" preview
-        FindUserByNameTool(**graph_ctx),  # resolve "Alice" → user id before create_issue
-        SuggestAssigneeTool(**graph_ctx),
-        FindSimilarIssuesTool(**graph_ctx),
+        GetIssuesTool(api=api, org_slug=org_slug, project_id=project_id),
+        GetStatusesTool(api=api, org_slug=org_slug, project_id=project_id),
+        CreateIssueTool(api=api, org_slug=org_slug, project_id=project_id,
+                        user_id=user_id, neo4j_client=neo4j_client),
+        # change priority/title/assignee by issue number
+        UpdateIssueTool(api=api, org_slug=org_slug, project_id=project_id, user_id=user_id),
+        UpdateIssueStatusTool(api=api, org_slug=org_slug, project_id=project_id, user_id=user_id),
+        # lets the model fulfill the "in Sprint X" preview
+        AddIssueToSprintTool(api=api, org_slug=org_slug, project_id=project_id),
+        # resolve "Alice" → user id before create_issue
+        FindUserByNameTool(neo4j_client=neo4j_client, org_slug=org_slug, project_id=project_id),
+        SuggestAssigneeTool(neo4j_client=neo4j_client, org_slug=org_slug, project_id=project_id),
+        FindSimilarIssuesTool(neo4j_client=neo4j_client, org_slug=org_slug, project_id=project_id),
     ]
     return create_react_agent(get_tool(), tools, prompt=_SYSTEM)
 
 
-async def run(state: SupervisorState, callbacks: Callbacks = None) -> dict:
+async def run(state: SupervisorState, callbacks: Callbacks = None) -> dict[str, Any]:
     org_slug = state["org_slug"]
     project_id = state.get("project_id") or ""
     user_id = state.get("user_id")

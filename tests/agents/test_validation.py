@@ -207,6 +207,76 @@ async def test_create_issue_with_known_sprint_proceeds() -> None:
     assert result["status"] == "awaiting_confirmation"
 
 
+# --- robust sprint-name matching --------------------------------------------
+# Regression: the old substring check rejected "Sprint 1" against a sprint
+# named "sprin1" because the query is longer than the haystack. The new
+# matcher must be lenient enough for natural phrasing the LLM (or the user
+# themselves) produces, but strict enough not to match unrelated names.
+
+
+@pytest.mark.asyncio
+async def test_check_sprint_resolves_query_longer_than_candidate() -> None:
+    """'Sprint 1' should resolve to a sprint actually named 'sprin1' — the
+    user (or the LLM) writes the full word, the project has the abbreviation."""
+    intent = IntentResult(
+        intent=Intent.CREATE_ISSUE, confidence=0.95,
+        entities={"title": "x", "type": "bug", "sprint": "Sprint 1"},
+    )
+    with (
+        patch(
+            "agents.supervisor.node_api_client.get_sprints",
+            new=AsyncMock(return_value=[{"id": "s1", "name": "sprin1"}]),
+        ),
+    ):
+        result = await _run_with_classify("put it in Sprint 1", intent)
+
+    assert result["status"] == "awaiting_confirmation", (
+        f"'Sprint 1' must resolve to 'sprin1'; got status={result['status']} "
+        f"msg={result['result']['message']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_sprint_resolves_query_that_is_a_prefix() -> None:
+    """'Sprint' should resolve to 'Sprint Alpha' (single token prefix)."""
+    intent = IntentResult(
+        intent=Intent.CREATE_ISSUE, confidence=0.95,
+        entities={"title": "x", "type": "bug", "sprint": "Sprint"},
+    )
+    with (
+        patch(
+            "agents.supervisor.node_api_client.get_sprints",
+            new=AsyncMock(return_value=[
+                {"id": "s1", "name": "Sprint Alpha"},
+                {"id": "s2", "name": "Sprint Beta"},
+            ]),
+        ),
+    ):
+        result = await _run_with_classify("put it in Sprint", intent)
+
+    assert result["status"] == "awaiting_confirmation"
+
+
+@pytest.mark.asyncio
+async def test_check_sprint_still_fails_on_truly_unknown_name() -> None:
+    """'Q4 launch' must NOT match 'sprin1' — the fuzzy matcher cannot be
+    so loose that any string matches any sprint."""
+    intent = IntentResult(
+        intent=Intent.CREATE_ISSUE, confidence=0.95,
+        entities={"title": "x", "type": "bug", "sprint": "Q4 launch"},
+    )
+    with (
+        patch(
+            "agents.supervisor.node_api_client.get_sprints",
+            new=AsyncMock(return_value=[{"id": "s1", "name": "sprin1"}]),
+        ),
+    ):
+        result = await _run_with_classify("put it in Q4 launch", intent)
+
+    assert result["status"] == "validation_failed"
+    assert "Q4 launch" in result["result"]["message"]
+
+
 # --- update_issue validation ------------------------------------------------
 
 

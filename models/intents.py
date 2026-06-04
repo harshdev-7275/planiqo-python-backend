@@ -19,11 +19,11 @@ class Intent(str, Enum):
 class IntentResult(BaseModel):
     intent: Intent
     confidence: float
-    entities: dict
+    entities: dict[str, Any]
 
     @field_validator("entities", mode="before")
     @classmethod
-    def coerce_entities(cls, v: Any) -> dict:
+    def coerce_entities(cls, v: Any) -> dict[str, Any]:
         # Some models return [{name: k, value: v}, ...] instead of {k: v}
         if isinstance(v, list):
             return {item["name"]: item["value"] for item in v if "name" in item}

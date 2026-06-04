@@ -1,7 +1,7 @@
 """Tests for FindUserByNameTool — the bridge between the model's
 "assign to Alice" and the user_id that create_issue requires."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -95,7 +95,7 @@ def test_find_user_by_name_tool_is_in_issue_agent_tool_list() -> None:
     from agents import issue_agent
     src = inspect.getsource(issue_agent._build_agent)
     assert "FindUserByNameTool" in src
-    assert "FindUserByNameTool(**graph_ctx)" in src
+    assert "FindUserByNameTool(" in src  # constructed in the tools list, not just imported
 
 
 def test_issue_agent_system_prompt_instructs_name_resolution() -> None:
