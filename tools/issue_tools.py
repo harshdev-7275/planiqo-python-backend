@@ -4,7 +4,7 @@ from langchain.tools import BaseTool
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from graph.queries import find_similar_issues, suggest_assignee
+from graph.queries import find_similar_issues, find_user_by_name, suggest_assignee
 
 
 class _NoInput(BaseModel):
@@ -231,6 +231,48 @@ class FindSimilarIssuesTool(BaseTool):
         except Exception as e:
             logger.error("tool=find_similar_issues failed: {}", e)
             return f"Failed to find similar issues: {e}"
+
+    def _run(self, **kwargs) -> str:
+        raise NotImplementedError("Use async")
+
+
+class _FindUserInput(BaseModel):
+    name: str = Field(description="Person's name or partial name (e.g. 'Alice', 'ali')")
+
+
+class FindUserByNameTool(BaseTool):
+    """Resolve a person the user mentions by name to a project member record.
+
+    MUST be called BEFORE create_issue whenever the user says something like
+    "assign to Alice" or "give it to Harsh" — the create_issue tool expects a
+    user ID, not a display name. Up to 5 matches are returned; pick the one
+    whose name/email best matches what the user said, or ask the user to
+    disambiguate if there are several.
+    """
+
+    name: str = "find_user_by_name"
+    description: str = (
+        "Find a project member by name. Args: name. Returns up to 5 matching "
+        "members with their id, name, and email. Use this to resolve a name "
+        "into a user ID before calling create_issue with an assignee."
+    )
+    args_schema: type[BaseModel] = _FindUserInput
+
+    neo4j_client: Any
+    org_slug: str
+    project_id: str
+
+    async def _arun(self, name: str) -> str:
+        logger.info("tool=find_user_by_name name='{}'", name)
+        try:
+            results = await find_user_by_name(self.neo4j_client, self.project_id, name)
+            if not results:
+                return f"No project member matching '{name}'."
+            lines = [f"id={r['id']} name={r['name']} email={r['email']}" for r in results]
+            return "\n".join(lines)
+        except Exception as e:
+            logger.error("tool=find_user_by_name failed: {}", e)
+            return f"Failed to find user: {e}"
 
     def _run(self, **kwargs) -> str:
         raise NotImplementedError("Use async")

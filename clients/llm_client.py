@@ -1,32 +1,42 @@
-from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage
+from langchain_core.language_models import BaseChatModel, LanguageModelInput
+from langchain_core.messages import BaseMessage
+from langchain_core.runnables import Runnable
 from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
-from loguru import logger
+from pydantic import SecretStr
 
 from config.settings import settings
-from models.results import LLMResult
+
+# A chat model — or a fallback-wrapped one — viewed as a Runnable.
+ChatRunnable = Runnable[LanguageModelInput, BaseMessage]
 
 
 def _make_groq(model: str) -> ChatGroq:
-    return ChatGroq(model=model, api_key=settings.GROQ_API_KEY, temperature=0)
+    return ChatGroq(
+        model=model,
+        api_key=SecretStr(settings.GROQ_API_KEY),
+        temperature=0,
+        max_retries=settings.LLM_MAX_RETRIES,
+    )
 
 
 def _make_kimi(model: str) -> ChatOpenAI:
     return ChatOpenAI(
         model=model,
-        api_key=settings.KIMI_API_KEY,
+        api_key=SecretStr(settings.KIMI_API_KEY),
         base_url=settings.KIMI_BASE_URL,
         temperature=0,
+        max_retries=settings.LLM_MAX_RETRIES,
     )
 
 
 def _make_minimax(model: str) -> ChatOpenAI:
     return ChatOpenAI(
         model=model,
-        api_key=settings.MINIMAX_API_KEY,
+        api_key=SecretStr(settings.MINIMAX_API_KEY),
         base_url=settings.MINIMAX_BASE_URL,
         temperature=0,
+        max_retries=settings.LLM_MAX_RETRIES,
     )
 
 
@@ -57,6 +67,28 @@ _TIERS, _TIER_NAMES = _build_tiers()
 _fast, _large, _tool = _TIERS
 
 
+def _model_name(model: BaseChatModel) -> str:
+    return getattr(model, "model_name", getattr(model, "model", "unknown"))
+
+
+def _with_fallbacks(primary: BaseChatModel, alternates: list[BaseChatModel]) -> ChatRunnable:
+    """Wrap a single-shot model so it falls back to the other tiers on error
+    (rate limit / 5xx). SAFE ONLY for stateless single calls — never for
+    tool-calling agents, where a re-run would repeat side effects."""
+    seen = {_model_name(primary)}
+    uniq: list[BaseChatModel] = []
+    for model in alternates:
+        name = _model_name(model)
+        if name not in seen:
+            seen.add(name)
+            uniq.append(model)
+    return primary.with_fallbacks(uniq) if uniq else primary
+
+
+# Built once: fast tier with the remaining tiers as ordered fallbacks.
+_FAST_RESILIENT = _with_fallbacks(_fast, [_large, _tool])
+
+
 def get_fast() -> BaseChatModel:
     return _fast
 
@@ -66,43 +98,13 @@ def get_large() -> BaseChatModel:
 
 
 def get_tool() -> BaseChatModel:
+    """Tool-calling tier for ReAct agents. Resilience here is per-call retry
+    (max_retries on the model), NOT cross-tier fallback — re-running a partially
+    executed agent would duplicate tool side effects."""
     return _tool
 
 
-def _is_rate_limit(exc: Exception) -> bool:
-    cls = type(exc).__name__
-    return cls == "RateLimitError"
-
-
-async def run_with_fallback(prompt: str, preferred: BaseChatModel | None = None) -> LLMResult:
-    models = [preferred, *_TIERS] if preferred else _TIERS
-    seen: set[str] = set()
-    candidates: list[BaseChatModel] = []
-    for m in models:
-        name = getattr(m, "model_name", getattr(m, "model", "unknown"))
-        if m is not None and name not in seen:
-            seen.add(name)
-            candidates.append(m)
-
-    last_error = "No models available"
-    for model in candidates:
-        model_name = getattr(model, "model_name", getattr(model, "model", "unknown"))
-        try:
-            response = await model.ainvoke([HumanMessage(content=prompt)])
-            tokens = response.usage_metadata.get("total_tokens", 0) if response.usage_metadata else 0
-            logger.info("llm_call provider={} model={} tokens={}", settings.AI_PROVIDER, model_name, tokens)
-            return LLMResult(
-                success=True,
-                content=str(response.content),
-                model_used=model_name,
-                tokens_used=tokens,
-            )
-        except Exception as e:
-            if _is_rate_limit(e):
-                logger.warning("Rate limited on {}, trying next tier", model_name)
-                last_error = f"Rate limited on {model_name}"
-                continue
-            logger.error("LLM call failed on {}: {}", model_name, e)
-            return LLMResult(success=False, error=str(e), model_used=model_name)
-
-    return LLMResult(success=False, error=last_error, model_used="none")
+def get_fast_resilient() -> ChatRunnable:
+    """Fast tier with cross-tier fallback — for stateless single-shot calls
+    such as intent classification."""
+    return _FAST_RESILIENT

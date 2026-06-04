@@ -1,4 +1,5 @@
 import pytest
+from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 
 from chains.intent import classify
@@ -6,16 +7,11 @@ from models.intents import Intent, IntentResult
 
 
 def _mock_llm(intent: Intent, confidence: float = 0.95, entities: dict | None = None):
-    """Returns a fake ChatGroq-compatible object whose with_structured_output returns a fixed result."""
+    """A Runnable LLM stub that emits the IntentResult as JSON, matching the real
+    chain shape (_PROMPT | llm | _parse_response). Per AIService.md, mock at the
+    LangChain interface with RunnableLambda."""
     fixed = IntentResult(intent=intent, confidence=confidence, entities=entities or {})
-
-    class _FakeLLM:
-        model_name = "mock"
-
-        def with_structured_output(self, schema):
-            return RunnableLambda(lambda _: fixed)
-
-    return _FakeLLM()
+    return RunnableLambda(lambda _: AIMessage(content=fixed.model_dump_json()))
 
 
 @pytest.mark.asyncio
@@ -59,3 +55,21 @@ async def test_empty_string_returns_unknown():
 async def test_whitespace_only_returns_unknown():
     result = await classify("   ")
     assert result.intent == Intent.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_classify_falls_back_when_primary_model_errors():
+    """A failing primary model must fall back to the next tier, not crash the chat."""
+    def _boom(_: object) -> AIMessage:
+        raise RuntimeError("rate limited")
+
+    primary = RunnableLambda(_boom)
+    fallback = RunnableLambda(
+        lambda _: AIMessage(
+            content=IntentResult(
+                intent=Intent.QUERY_ISSUES, confidence=0.9, entities={}
+            ).model_dump_json()
+        )
+    )
+    result = await classify("show me issues", llm=primary.with_fallbacks([fallback]))
+    assert result.intent == Intent.QUERY_ISSUES

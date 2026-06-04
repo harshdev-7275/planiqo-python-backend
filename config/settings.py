@@ -62,6 +62,12 @@ class Settings(BaseSettings):
     MAX_TOKENS_PER_REQUEST: int = 5000
     GROQ_RATE_LIMIT_RPM: int = 28
 
+    # Resilience — per-call retry on transient errors (rate limit / 5xx)
+    LLM_MAX_RETRIES: int = 2
+
+    # Cost control — cumulative token quota per org (0 = unlimited / disabled)
+    ORG_TOKEN_QUOTA: int = 0
+
     model_config = {"env_file": ".env", "extra": "ignore"}
 
 

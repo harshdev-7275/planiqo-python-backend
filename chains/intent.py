@@ -1,11 +1,11 @@
 import re
 
-from langchain_core.language_models import BaseChatModel
+from langchain_core.callbacks import Callbacks
 from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 
-from clients.llm_client import get_fast
+from clients.llm_client import ChatRunnable, get_fast_resilient
 from models.intents import Intent, IntentResult
 
 _SYSTEM = (
@@ -34,14 +34,16 @@ def _parse_response(message: AIMessage) -> IntentResult:
     return IntentResult.model_validate_json(content)
 
 
-def _build_chain(llm: BaseChatModel):
+def _build_chain(llm: ChatRunnable) -> Runnable[dict[str, str], IntentResult]:
     return _PROMPT | llm | RunnableLambda(_parse_response)
 
 
-async def classify(message: str, llm: BaseChatModel | None = None) -> IntentResult:
+async def classify(
+    message: str, llm: ChatRunnable | None = None, callbacks: Callbacks = None
+) -> IntentResult:
     if not message.strip():
         return IntentResult(intent=Intent.UNKNOWN, confidence=0.0, entities={})
 
-    chain = _build_chain(llm or get_fast())
-    result = await chain.ainvoke({"message": message})
-    return result  # type: ignore[return-value]
+    chain = _build_chain(llm or get_fast_resilient())
+    config: RunnableConfig | None = {"callbacks": callbacks} if callbacks else None
+    return await chain.ainvoke({"message": message}, config=config)

@@ -13,6 +13,11 @@ async def suggest_assignee(
       +1 per comment on same-type issues
       -1 per currently open issue (load penalty)
     Returns list of {userId, score} sorted by score descending.
+
+    Tombstoned (removed) members are excluded: the load query already filters
+    on ``MEMBER_OF.removed_at IS NULL``, and we intersect the final result
+    with the set of active member IDs from that query. An ex-member's old
+    resolved-issue signal is therefore not surfaced as a suggestion.
     """
     resolved = await neo4j_client.run(
         """
@@ -32,9 +37,12 @@ async def suggest_assignee(
         {"project_id": project_id, "issue_type": issue_type},
     )
 
+    # Load query: project members ONLY (not tombstones). The active set built
+    # from this row set is the final filter for the suggestions.
     load = await neo4j_client.run(
         """
-        MATCH (u:User)-[:MEMBER_OF]->(p:Project {id: $project_id})
+        MATCH (u:User)-[r:MEMBER_OF]->(p:Project {id: $project_id})
+        WHERE r.removed_at IS NULL
         OPTIONAL MATCH (u)-[:ASSIGNED_TO]->(open:Issue)-[:IN_PROJECT]->(p)
         WHERE open.completedAt IS NULL
         RETURN u.id AS userId, u.name AS userName, count(open) AS open_count
@@ -43,9 +51,11 @@ async def suggest_assignee(
     )
 
     logger.debug(
-        "suggest_assignee project={} type={} | resolved={} commented={} members={}",
+        "suggest_assignee project={} type={} | resolved={} commented={} active_members={}",
         project_id, issue_type, len(resolved), len(commented), len(load),
     )
+
+    active_member_ids: set[str] = {row["userId"] for row in load}
 
     scores: dict[str, float] = {}
     names:  dict[str, str]   = {}
@@ -63,9 +73,15 @@ async def suggest_assignee(
             scores[user_id] = 0.0
         scores[user_id] -= row["open_count"]
 
+    # Final filter: only active members. An ex-member who left the project
+    # but has historical resolved-issue signal will have a positive score
+    # above — drop them here.
     result = sorted(
-        [{"userId": uid, "userName": names.get(uid, uid), "score": score}
-         for uid, score in scores.items()],
+        [
+            {"userId": uid, "userName": names.get(uid, uid), "score": score}
+            for uid, score in scores.items()
+            if uid in active_member_ids
+        ],
         key=lambda x: x["score"],
         reverse=True,
     )
@@ -78,7 +94,7 @@ async def suggest_assignee(
     else:
         logger.info(
             "suggest_assignee project={} type={}: no candidates — "
-            "no MEMBER_OF relationships in graph (run /graph/sync first)",
+            "no active MEMBER_OF relationships in graph (run /graph/sync first)",
             project_id, issue_type,
         )
 
@@ -138,4 +154,38 @@ async def get_expertise_map(
         {"project_id": project_id},
     )
     logger.info("get_expertise_map project={} users={}", project_id, len(results))
+    return results
+
+
+async def find_user_by_name(
+    neo4j_client,
+    project_id: str,
+    name: str,
+) -> list[dict]:
+    """Resolve a human name to project member candidates.
+
+    Case-insensitive substring match on name OR email — handles "Alice"
+    matching "Alice Smith", and "alice@acme.com" matching "alice". Filters
+    out tombstoned (removed) members. Up to 5 results, ordered by name.
+    """
+    query = (name or "").strip()
+    if not query:
+        return []
+
+    results = await neo4j_client.run(
+        """
+        MATCH (u:User)-[r:MEMBER_OF]->(p:Project {id: $project_id})
+        WHERE r.removed_at IS NULL
+          AND (toLower(u.name)  CONTAINS toLower($name)
+            OR toLower(u.email) CONTAINS toLower($name))
+        RETURN u.id AS id, u.name AS name, u.email AS email
+        ORDER BY u.name
+        LIMIT 5
+        """,
+        {"project_id": project_id, "name": query},
+    )
+    logger.info(
+        "find_user_by_name project={} query='{}' matches={}",
+        project_id, query, len(results),
+    )
     return results

@@ -1,7 +1,9 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from graph.queries import find_similar_issues, get_expertise_map, suggest_assignee
+from graph.queries import (
+    find_similar_issues, find_user_by_name, get_expertise_map, suggest_assignee,
+)
 
 
 def _neo4j(*call_returns):
@@ -91,6 +93,102 @@ async def test_suggest_assignee_empty_graph_returns_empty():
     neo = _neo4j([], [], [])
     results = await suggest_assignee(neo, "proj-1", "title", "bug")
     assert results == []
+
+
+@pytest.mark.asyncio
+async def test_suggest_assignee_load_query_filters_removed_members():
+    """The cypher that fetches current project members must exclude
+    tombstoned edges — otherwise an ex-member's open-issue count is still
+    counted in the load penalty and they remain a 'candidate'."""
+    neo = _neo4j([], [], [])
+    await suggest_assignee(neo, "proj-1", "title", "bug")
+    load_call = neo.run.call_args_list[2]  # 3rd cypher = load
+    load_query = load_call[0][0]
+    assert "MEMBER_OF" in load_query
+    assert "removed_at IS NULL" in load_query
+
+
+@pytest.mark.asyncio
+async def test_suggest_assignee_excludes_tombstoned_members_from_result():
+    """An ex-member with great past work must NOT be in the suggestion list
+    once they are tombstoned. Setup: the user appears in the resolved and
+    load queries, but with ``removed_at`` set; the active filter at the end
+    drops them.
+
+    The current implementation does this by filtering the final result on
+    the active-member set from the load query. We model that here: the
+    load query returns [] (so active set is empty), the resolved query
+    returns a high-scoring user, and we expect the final result to be [].
+    """
+    neo = _neo4j(
+        # resolved
+        [{"userId": "u-ex", "cnt": 5}],
+        # commented
+        [],
+        # load (empty — u-ex is tombstoned, so not in active members)
+        [],
+    )
+    results = await suggest_assignee(neo, "proj-1", "title", "bug")
+    assert results == [], "tombstoned user must not surface as a suggestion"
+
+
+@pytest.mark.asyncio
+async def test_suggest_assignee_keeps_active_member_with_resolved_history():
+    """Sanity: a user who IS in the active load set AND has resolved history
+    should still surface — the tombstone filter only drops ex-members, not
+    low-activity members."""
+    neo = _neo4j(
+        [{"userId": "u1", "cnt": 2}],   # 2 resolved bugs = score 6
+        [],
+        [{"userId": "u1", "userName": "Alice", "open_count": 0}],
+    )
+    results = await suggest_assignee(neo, "proj-1", "title", "bug")
+    assert len(results) == 1
+    assert results[0]["userId"] == "u1"
+    assert results[0]["score"] == 6.0  # 2*3 - 0
+
+
+@pytest.mark.asyncio
+async def test_suggest_assignee_mixed_active_and_tombstoned():
+    """A tombstoned user with great history AND an active user with none —
+    only the active user should appear."""
+    neo = _neo4j(
+        # resolved: tombstoned user has tons of history, active has 1
+        [{"userId": "u-tomb", "cnt": 10}, {"userId": "u-active", "cnt": 1}],
+        [],
+        # load: only the active user
+        [{"userId": "u-active", "userName": "Bob", "open_count": 0}],
+    )
+    results = await suggest_assignee(neo, "proj-1", "title", "bug")
+    assert len(results) == 1
+    assert results[0]["userId"] == "u-active"
+    assert results[0]["userName"] == "Bob"
+
+
+# --- tombstone-aware behavior (regression for the original bug report) -----
+
+
+@pytest.mark.asyncio
+async def test_suggest_assignee_excludes_ex_member_who_left_project():
+    """The actual bug: an ex-member who left the project still gets
+    recommended by smart-assignee. With tombstones, they are filtered out.
+
+    Seed:
+      - u-ex was a great engineer (5 resolved bugs) and IS in resolved count
+      - u-ex's MEMBER_OF is tombstoned (not in load query result)
+      - u-active is a current member (in load, 0 open)
+    Expect:
+      - Only u-active is recommended.
+    """
+    neo = _neo4j(
+        [{"userId": "u-ex", "cnt": 5}],
+        [],
+        [{"userId": "u-active", "userName": "Current Member", "open_count": 0}],
+    )
+    results = await suggest_assignee(neo, "proj-1", "title", "bug")
+    user_ids = {r["userId"] for r in results}
+    assert "u-ex" not in user_ids, "tombstoned ex-member must not be recommended"
+    assert "u-active" in user_ids
 
 
 @pytest.mark.asyncio
@@ -224,3 +322,81 @@ async def test_get_expertise_map_query_covers_all_activity_types():
     assert "ASSIGNED_TO" in query
     assert "COMMENTED_ON" in query
     assert "CHANGED" in query
+
+
+# ---------------------------------------------------------------------------
+# find_user_by_name
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_find_user_by_name_empty_query_returns_empty():
+    neo = _neo4j([])
+    results = await find_user_by_name(neo, "proj-1", "")
+    assert results == []
+    neo.run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_find_user_by_name_whitespace_query_returns_empty():
+    neo = _neo4j([])
+    results = await find_user_by_name(neo, "proj-1", "   ")
+    assert results == []
+    neo.run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_find_user_by_name_returns_neo4j_results():
+    expected = [
+        {"id": "u-alice", "name": "Alice Smith", "email": "alice@acme.com"},
+        {"id": "u-alicia", "name": "Alicia Keys", "email": "alicia@acme.com"},
+    ]
+    neo = _neo4j(expected)
+    results = await find_user_by_name(neo, "proj-1", "ali")
+    assert results == expected
+
+
+@pytest.mark.asyncio
+async def test_find_user_by_name_is_case_insensitive():
+    """The cypher does toLower() on both sides; the params should pass the
+    original casing and let the DB lower it. Lock that in."""
+    neo = _neo4j([{"id": "u1", "name": "Harsh", "email": "h@x.com"}])
+    await find_user_by_name(neo, "proj-1", "HARSH")
+    _, params = neo.run.call_args[0]
+    # We pass the raw query — the DB lowercases it.
+    assert params["name"] == "HARSH"
+    assert params["project_id"] == "proj-1"
+
+
+@pytest.mark.asyncio
+async def test_find_user_by_name_query_is_parameterised():
+    neo = _neo4j([])
+    await find_user_by_name(neo, "proj-1", "Alice")
+    query, params = neo.run.call_args[0]
+    assert "Alice" not in query
+    assert "proj-1" not in query
+    assert "$name" in query
+    assert "$project_id" in query
+    assert params["name"] == "Alice"
+
+
+@pytest.mark.asyncio
+async def test_find_user_by_name_query_filters_removed_members():
+    """Cypher must filter on r.removed_at IS NULL so tombstoned members do
+    not match — they left the project and must not be assignable."""
+    neo = _neo4j([])
+    await find_user_by_name(neo, "proj-1", "Alice")
+    query, _ = neo.run.call_args[0]
+    assert "removed_at" in query
+    assert "IS NULL" in query
+
+
+@pytest.mark.asyncio
+async def test_find_user_by_name_query_matches_email_too():
+    """A user might say 'ping alice@acme.com' — the resolver must also
+    match on email substring."""
+    neo = _neo4j([])
+    await find_user_by_name(neo, "proj-1", "alice@acme.com")
+    query, _ = neo.run.call_args[0]
+    assert "u.email" in query
+    assert "u.name" in query

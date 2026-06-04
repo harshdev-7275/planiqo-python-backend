@@ -1,8 +1,9 @@
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from graph.sync import (
     full_sync,
+    tombstone_missing_members,
     upsert_change_activity,
     upsert_comment_activity,
     upsert_issue,
@@ -266,8 +267,157 @@ async def test_full_sync_returns_node_and_rel_counts():
     result = await full_sync(neo, api, "acme")
     assert "nodes_created" in result
     assert "relationships_created" in result
+    assert "tombstones_created" in result
     assert result["nodes_created"] > 0
     assert result["relationships_created"] > 0
+    assert result["tombstones_created"] == 0  # first sync: no prior state to tombstone
+
+
+# ---------------------------------------------------------------------------
+# upsert_member — tombstone reset on rejoin
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upsert_member_resets_removed_at_on_existing_relationship():
+    """A re-join must clear the tombstone. We verify by checking the cypher
+    sets ``removed_at = null`` on the relationship — applies to both new
+    and existing edges (we use a single SET, not ON CREATE/ON MATCH)."""
+    neo = _neo4j()
+    await upsert_member(neo, user_id="u1", project_id="proj-1", role="member")
+    query, _ = neo.run.call_args[0]
+    assert "removed_at" in query
+    assert "null" in query
+    # The SET clause must cover BOTH the role and the tombstone reset.
+    assert "SET r.role" in query
+    assert "r.removed_at = null" in query
+
+
+# ---------------------------------------------------------------------------
+# tombstone_missing_members
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tombstone_marks_only_missing_active_users():
+    """Users in the graph's MEMBER_OF who are NOT in active_user_ids get
+    removed_at set. Users still in the set are untouched."""
+    neo = MagicMock()
+    neo.run = AsyncMock(return_value=[{"tombstoned": 2}])
+    result = await tombstone_missing_members(neo, "proj-1", {"u1", "u2"})
+
+    assert result == 2
+    query, params = neo.run.call_args[0]
+    # Must filter on removed_at IS NULL (idempotent — already-tombstoned rows skipped).
+    assert "removed_at IS NULL" in query
+    # Must use a NOT IN clause with the active set.
+    assert "NOT u.id IN" in query
+    assert "active_user_ids" in params
+    assert sorted(params["active_user_ids"]) == ["u1", "u2"]
+
+
+@pytest.mark.asyncio
+async def test_tombstone_with_empty_active_set_marks_everything():
+    """If the project's entire roster was wiped, every still-active edge
+    must be tombstoned — no NOT IN clause needed because there are no
+    active IDs to keep."""
+    neo = MagicMock()
+    neo.run = AsyncMock(return_value=[{"tombstoned": 5}])
+    result = await tombstone_missing_members(neo, "proj-1", set())
+
+    assert result == 5
+    query, params = neo.run.call_args[0]
+    assert "NOT u.id IN" not in query  # special-cased empty set
+    assert "active_user_ids" not in params
+    assert "removed_at IS NULL" in query
+
+
+@pytest.mark.asyncio
+async def test_tombstone_uses_parameterised_cypher():
+    """No literal project_id in the query string."""
+    neo = MagicMock()
+    neo.run = AsyncMock(return_value=[{"tombstoned": 0}])
+    await tombstone_missing_members(neo, "proj-42", {"u1"})
+    query, _ = neo.run.call_args[0]
+    assert "proj-42" not in query
+    assert "$project_id" in query
+
+
+@pytest.mark.asyncio
+async def test_tombstone_returns_zero_on_empty_neo4j_result():
+    neo = MagicMock()
+    neo.run = AsyncMock(return_value=[])
+    assert await tombstone_missing_members(neo, "proj-1", {"u1"}) == 0
+
+
+# ---------------------------------------------------------------------------
+# full_sync — tombstone integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_full_sync_calls_tombstone_with_active_member_set():
+    """The orchestrator must feed the active-member set to tombstone_missing_members
+    so the graph reflects Node's current view of the project."""
+    neo = _neo4j()
+    api = _api(
+        get_projects=_PROJECTS,
+        get_project_members=_MEMBERS,  # contains "u1"
+        get_issues=[],
+    )
+    with patch(
+        "graph.sync.tombstone_missing_members",
+        new=AsyncMock(return_value=0),
+    ) as tomb_fn:
+        await full_sync(neo, api, "acme")
+
+    tomb_fn.assert_awaited_once()
+    args = tomb_fn.await_args.args
+    # args: (neo4j_client, project_id, active_user_ids)
+    assert args[1] == "proj-1"
+    assert args[2] == {"u1"}
+
+
+@pytest.mark.asyncio
+async def test_full_sync_tombstone_count_in_return_value():
+    """The summary dict must surface how many tombstones were created so ops
+    can spot mass-removal events (a project whose team all left)."""
+    neo = _neo4j()
+    api = _api(
+        get_projects=_PROJECTS,
+        get_project_members=_MEMBERS,
+        get_issues=[],
+    )
+    with patch(
+        "graph.sync.tombstone_missing_members",
+        new=AsyncMock(return_value=3),
+    ):
+        result = await full_sync(neo, api, "acme")
+    assert result["tombstones_created"] == 3
+
+
+@pytest.mark.asyncio
+async def test_full_sync_reactivates_rejoined_member():
+    """If a previously-tombstoned user is back in Node's response, the
+    upsert_member path clears removed_at — verified by the cypher itself."""
+    neo = _neo4j()
+    api = _api(
+        get_projects=_PROJECTS,
+        get_project_members=_MEMBERS,  # u1 is in here
+        get_issues=[],
+    )
+    await full_sync(neo, api, "acme")
+
+    # The second-to-last run call (before the tombstone count) is the
+    # upsert_member for "u1". Its cypher must set removed_at = null.
+    upsert_calls = [
+        c for c in neo.run.call_args_list
+        if "MEMBER_OF" in c[0][0] and "MERGE" in c[0][0]
+    ]
+    assert upsert_calls, "expected at least one upsert_member cypher"
+    cypher = upsert_calls[0][0][0]
+    assert "removed_at" in cypher
+    assert "null" in cypher
 
 
 @pytest.mark.asyncio
