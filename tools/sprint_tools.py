@@ -21,7 +21,7 @@ class GetSprintsTool(BaseTool):
     async def _arun(self) -> str:
         logger.info("tool=get_sprints org={} project={}", self.org_slug, self.project_id)
         try:
-            sprint_list: list = await self.api.get_sprints(self.org_slug, self.project_id)
+            sprint_list: list[dict[str, Any]] = await self.api.get_sprints(self.org_slug, self.project_id)
             if not sprint_list:
                 return "No sprints found."
             lines = [
@@ -64,6 +64,43 @@ class GetActiveSprintTool(BaseTool):
         raise NotImplementedError("Use async")
 
 
+class _CreateSprintInput(BaseModel):
+    name: str = Field(description="Sprint name")
+    goal: str | None = Field(default=None, description="Optional sprint goal")
+
+
+class CreateSprintTool(BaseTool):
+    name: str = "create_sprint"
+    description: str = "Create a sprint. Args: name, goal?."
+    args_schema: type[BaseModel] = _CreateSprintInput
+
+    api: Any
+    org_slug: str
+    project_id: str
+    user_id: str | None = None
+
+    async def _arun(self, name: str, goal: str | None = None) -> str:
+        logger.info("tool=create_sprint name='{}' project={}", name, self.project_id)
+        try:
+            body: dict[str, Any] = {"name": name}
+            if goal:
+                body["goal"] = goal
+            result = await self.api.post(
+                f"/orgs/{self.org_slug}/projects/{self.project_id}/sprints",
+                body,
+                user_id=self.user_id,
+            )
+            created = result.get("name", name)
+            logger.info("tool=create_sprint created '{}'", created)
+            return f"Created sprint '{created}'."
+        except Exception as e:
+            logger.error("tool=create_sprint failed: {}", e)
+            return f"Failed to create sprint: {e}"
+
+    def _run(self, **kwargs: Any) -> str:
+        raise NotImplementedError("Use async")
+
+
 class _AddIssueInput(BaseModel):
     sprint_id: str = Field(description="Sprint ID")
     issue_id: str = Field(description="Issue ID")
@@ -87,5 +124,5 @@ class AddIssueToSprintTool(BaseTool):
             logger.error("tool=add_issue_to_sprint failed: {}", e)
             return f"Failed to add issue to sprint: {e}"
 
-    def _run(self, **kwargs) -> str:
+    def _run(self, **kwargs: Any) -> str:
         raise NotImplementedError("Use async")

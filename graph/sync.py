@@ -1,7 +1,12 @@
+from typing import Any
+
 from loguru import logger
 
+from clients.neo4j_client import Neo4jClient
+from clients.node_api import NodeAPIClient
 
-async def upsert_user(neo4j_client, user: dict) -> None:
+
+async def upsert_user(neo4j_client: Neo4jClient, user: dict[str, Any]) -> None:
     await neo4j_client.run(
         """
         MERGE (u:User {id: $id})
@@ -16,7 +21,7 @@ async def upsert_user(neo4j_client, user: dict) -> None:
     )
 
 
-async def upsert_project(neo4j_client, project: dict) -> None:
+async def upsert_project(neo4j_client: Neo4jClient, project: dict[str, Any]) -> None:
     await neo4j_client.run(
         """
         MERGE (p:Project {id: $id})
@@ -30,7 +35,7 @@ async def upsert_project(neo4j_client, project: dict) -> None:
     )
 
 
-async def upsert_issue(neo4j_client, issue: dict) -> None:
+async def upsert_issue(neo4j_client: Neo4jClient, issue: dict[str, Any]) -> None:
     await neo4j_client.run(
         """
         MERGE (i:Issue {id: $id})
@@ -89,7 +94,7 @@ async def upsert_issue(neo4j_client, issue: dict) -> None:
 
 
 async def upsert_member(
-    neo4j_client, user_id: str, project_id: str, role: str
+    neo4j_client: Neo4jClient, user_id: str, project_id: str, role: str
 ) -> None:
     """Upsert a User-(MEMBER_OF)->Project edge.
 
@@ -108,7 +113,7 @@ async def upsert_member(
 
 
 async def tombstone_missing_members(
-    neo4j_client,
+    neo4j_client: Neo4jClient,
     project_id: str,
     active_user_ids: set[str],
 ) -> int:
@@ -133,7 +138,7 @@ async def tombstone_missing_members(
             SET r.removed_at = datetime()
             RETURN count(r) AS tombstoned
         """
-        params: dict = {
+        params: dict[str, Any] = {
             "project_id": project_id,
             "active_user_ids": list(active_user_ids),
         }
@@ -151,7 +156,7 @@ async def tombstone_missing_members(
 
 
 async def upsert_comment_activity(
-    neo4j_client, user_id: str, issue_id: str
+    neo4j_client: Neo4jClient, user_id: str, issue_id: str
 ) -> None:
     await neo4j_client.run(
         """
@@ -166,7 +171,7 @@ async def upsert_comment_activity(
 
 
 async def upsert_change_activity(
-    neo4j_client, user_id: str, issue_id: str, field: str
+    neo4j_client: Neo4jClient, user_id: str, issue_id: str, field: str
 ) -> None:
     await neo4j_client.run(
         """
@@ -181,22 +186,22 @@ async def upsert_change_activity(
 
 
 async def full_sync(
-    neo4j_client,
-    node_api_client,
+    neo4j_client: Neo4jClient,
+    node_api_client: NodeAPIClient,
     org_slug: str,
 ) -> dict[str, int]:
     nodes_created = 0
     relationships_created = 0
     tombstones_created = 0
 
-    project_list: list = await node_api_client.get_projects(org_slug)
+    project_list: list[dict[str, Any]] = await node_api_client.get_projects(org_slug)
     logger.info("full_sync org={} projects_found={}", org_slug, len(project_list))
 
     for project in project_list:
         await upsert_project(neo4j_client, project)
         nodes_created += 1
 
-        members: list = await node_api_client.get_project_members(org_slug, project["id"])
+        members: list[dict[str, Any]] = await node_api_client.get_project_members(org_slug, project["id"])
         active_ids: set[str] = set()
         for member in members:
             await upsert_user(neo4j_client, member)
@@ -214,7 +219,7 @@ async def full_sync(
         )
         tombstones_created += tombstoned
 
-        issues: list = await node_api_client.get_issues(org_slug, project["id"])
+        issues: list[dict[str, Any]] = await node_api_client.get_issues(org_slug, project["id"])
         for issue in issues:
             await upsert_issue(neo4j_client, issue)
             nodes_created += 1

@@ -23,7 +23,7 @@ class GetStatusesTool(BaseTool):
     async def _arun(self) -> str:
         logger.info("tool=get_statuses org={} project={}", self.org_slug, self.project_id)
         try:
-            statuses: list = await self.api.get(
+            statuses: list[dict[str, Any]] = await self.api.get(
                 f"/bot/orgs/{self.org_slug}/projects/{self.project_id}/statuses"
             )
             if not statuses:
@@ -50,7 +50,7 @@ class GetIssuesTool(BaseTool):
     async def _arun(self) -> str:
         logger.info("tool=get_issues org={} project={}", self.org_slug, self.project_id)
         try:
-            issues: list = await self.api.get_issues(self.org_slug, self.project_id)
+            issues: list[dict[str, Any]] = await self.api.get_issues(self.org_slug, self.project_id)
             if not issues:
                 return "No issues found."
             lines = [
@@ -104,7 +104,7 @@ class CreateIssueTool(BaseTool):
                 resolved_status_id = default["id"]
                 logger.debug("tool=create_issue default status='{}' id={}", default["name"], resolved_status_id)
 
-            body: dict = {
+            body: dict[str, Any] = {
                 "title": title,
                 "type": type,
                 "priority": priority,
@@ -165,7 +165,7 @@ class CreateIssueTool(BaseTool):
             logger.error("tool=create_issue failed: {}", e)
             return f"Failed to create issue: {e}"
 
-    def _run(self, **kwargs) -> str:
+    def _run(self, **kwargs: Any) -> str:
         raise NotImplementedError("Use async")
 
 
@@ -203,7 +203,7 @@ class SuggestAssigneeTool(BaseTool):
             logger.error("tool=suggest_assignee failed: {}", e)
             return f"Failed to suggest assignee: {e}"
 
-    def _run(self, **kwargs) -> str:
+    def _run(self, **kwargs: Any) -> str:
         raise NotImplementedError("Use async")
 
 
@@ -232,7 +232,7 @@ class FindSimilarIssuesTool(BaseTool):
             logger.error("tool=find_similar_issues failed: {}", e)
             return f"Failed to find similar issues: {e}"
 
-    def _run(self, **kwargs) -> str:
+    def _run(self, **kwargs: Any) -> str:
         raise NotImplementedError("Use async")
 
 
@@ -274,7 +274,76 @@ class FindUserByNameTool(BaseTool):
             logger.error("tool=find_user_by_name failed: {}", e)
             return f"Failed to find user: {e}"
 
-    def _run(self, **kwargs) -> str:
+    def _run(self, **kwargs: Any) -> str:
+        raise NotImplementedError("Use async")
+
+
+class _UpdateIssueInput(BaseModel):
+    issue_number: int = Field(description="Issue number the user referred to, e.g. 5 for '#5'")
+    priority: str | None = Field(default=None, description="low|medium|high|critical")
+    title: str | None = Field(default=None, description="New title")
+    assignee_id: str | None = Field(
+        default=None,
+        description="Assignee user ID — resolve a name with find_user_by_name first",
+    )
+
+
+class UpdateIssueTool(BaseTool):
+    """Update fields (priority, title, assignee) on an existing issue.
+
+    The user refers to an issue by its NUMBER ("#5"), but the backend keys on
+    the issue's UUID. This tool resolves the number to an ID itself, so the
+    model only needs the number it already has — it never has to surface a raw
+    UUID. To change status use update_issue_status; to move an issue into a
+    sprint use add_issue_to_sprint.
+    """
+
+    name: str = "update_issue"
+    description: str = (
+        "Update an existing issue's priority, title, or assignee. "
+        "Args: issue_number (e.g. 5), priority?, title?, assignee_id?."
+    )
+    args_schema: type[BaseModel] = _UpdateIssueInput
+
+    api: Any
+    org_slug: str
+    project_id: str
+    user_id: str | None = None
+
+    async def _arun(
+        self,
+        issue_number: int,
+        priority: str | None = None,
+        title: str | None = None,
+        assignee_id: str | None = None,
+    ) -> str:
+        logger.info("tool=update_issue number={} project={}", issue_number, self.project_id)
+        body: dict[str, Any] = {}
+        if priority:
+            body["priority"] = priority
+        if title:
+            body["title"] = title
+        if assignee_id:
+            body["assigneeId"] = assignee_id
+        if not body:
+            return "Nothing to update — specify a priority, title, or assignee."
+        try:
+            issues: list[dict[str, Any]] = await self.api.get_issues(self.org_slug, self.project_id)
+            match = next((i for i in issues if i.get("number") == issue_number), None)
+            if not match:
+                return f"Issue #{issue_number} not found in this project."
+            await self.api.patch(
+                f"/orgs/{self.org_slug}/projects/{self.project_id}/issues/{match['id']}",
+                body,
+                user_id=self.user_id,
+            )
+            logger.info("tool=update_issue updated #{} fields={}", issue_number, list(body))
+            return f"Updated #{issue_number}."
+        except Exception as e:
+            logger.error("tool=update_issue failed: {}", e)
+            return f"Failed to update issue: {e}"
+
+    def _run(self, **kwargs: Any) -> str:
         raise NotImplementedError("Use async")
 
 
@@ -307,5 +376,5 @@ class UpdateIssueStatusTool(BaseTool):
             logger.error("tool=update_issue_status failed: {}", e)
             return f"Failed to update issue: {e}"
 
-    def _run(self, **kwargs) -> str:
+    def _run(self, **kwargs: Any) -> str:
         raise NotImplementedError("Use async")

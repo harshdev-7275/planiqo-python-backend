@@ -1,7 +1,12 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from tools.sprint_tools import AddIssueToSprintTool, GetActiveSprintTool, GetSprintsTool
+from tools.sprint_tools import (
+    AddIssueToSprintTool,
+    CreateSprintTool,
+    GetActiveSprintTool,
+    GetSprintsTool,
+)
 
 CTX = {"org_slug": "acme", "project_id": "proj-1"}
 
@@ -122,4 +127,52 @@ async def test_add_issue_to_sprint_returns_error_string_on_failure():
     api = _mock_api(add_issue_to_sprint=AsyncMock(side_effect=Exception("404")))
     tool = AddIssueToSprintTool(api=api, **CTX)
     result = await tool._arun(sprint_id="s2", issue_id="issue-7")
+    assert "Failed" in result
+
+
+# --- CreateSprintTool ---
+
+@pytest.mark.asyncio
+async def test_create_sprint_returns_confirmation():
+    api = _mock_api(post=AsyncMock(return_value={"id": "s9", "name": "Sprint 7"}))
+    tool = CreateSprintTool(api=api, **CTX)
+    result = await tool._arun(name="Sprint 7")
+    assert "Sprint 7" in result
+
+
+@pytest.mark.asyncio
+async def test_create_sprint_posts_to_correct_path_with_acting_user():
+    api = _mock_api(post=AsyncMock(return_value={"id": "s9", "name": "Sprint 7"}))
+    tool = CreateSprintTool(api=api, org_slug="acme", project_id="proj-1", user_id="u-42")
+    await tool._arun(name="Sprint 7")
+    api.post.assert_called_once_with(
+        "/orgs/acme/projects/proj-1/sprints",
+        {"name": "Sprint 7"},
+        user_id="u-42",
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_sprint_includes_goal_when_provided():
+    api = _mock_api(post=AsyncMock(return_value={"id": "s9", "name": "Sprint 7"}))
+    tool = CreateSprintTool(api=api, **CTX)
+    await tool._arun(name="Sprint 7", goal="Ship checkout")
+    _, body = api.post.call_args[0]
+    assert body["goal"] == "Ship checkout"
+
+
+@pytest.mark.asyncio
+async def test_create_sprint_omits_goal_when_absent():
+    api = _mock_api(post=AsyncMock(return_value={"id": "s9", "name": "Sprint 7"}))
+    tool = CreateSprintTool(api=api, **CTX)
+    await tool._arun(name="Sprint 7")
+    _, body = api.post.call_args[0]
+    assert "goal" not in body
+
+
+@pytest.mark.asyncio
+async def test_create_sprint_returns_error_string_on_failure():
+    api = _mock_api(post=AsyncMock(side_effect=Exception("403")))
+    tool = CreateSprintTool(api=api, **CTX)
+    result = await tool._arun(name="Sprint 7")
     assert "Failed" in result

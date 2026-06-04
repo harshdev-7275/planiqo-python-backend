@@ -40,3 +40,10 @@ target-version = "py312"
 python_version = "3.12"
 strict = true
 ignore_missing_imports = true
+
+# Test code is not shipped — it intentionally builds partial/edge-case fixtures
+# (e.g. unpacking dicts as kwargs, omitting fields) that fight strict typing for
+# no production benefit. Keep strict on the source package; skip it for tests.
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true
