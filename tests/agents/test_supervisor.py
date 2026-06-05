@@ -42,6 +42,10 @@ async def _run(
     # fabricated paths set classify up themselves.
     default_entities = {"title": message} if intent == Intent.CREATE_ISSUE else {}
     with (
+        # Defer the pre-router to classify so these tests exercise the
+        # classify + metering path. Tests that want to exercise the pre-router
+        # itself patch it separately.
+        patch("agents.supervisor.pre_route", new=AsyncMock(return_value=None)),
         patch(
             "agents.supervisor.classify",
             new=AsyncMock(return_value=_intent(intent, **default_entities)),

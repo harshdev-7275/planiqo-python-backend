@@ -68,6 +68,9 @@ async def test_supervisor_classify_invokes_usage_callback() -> None:
     # affect the bound reference once any other test has already imported it.
     with (
         patch("chains.intent.get_fast_resilient", return_value=_fake_chat_model()),
+        # Defer the pre-router to classify — this test is about the classify
+        # chain's metering, not about the pre-router path.
+        patch("agents.supervisor.pre_route", new=AsyncMock(return_value=None)),
         patch(
             "agents.issue_agent.run",
             new=AsyncMock(return_value={"result": {"message": "issue done"}}),
@@ -75,8 +78,6 @@ async def test_supervisor_classify_invokes_usage_callback() -> None:
         patch("agents.sprint_agent.run", new=AsyncMock()),
     ):
         from agents.supervisor import run
-        # The message must reach the LLM classify (not the pre-router), so it
-        # is phrased to avoid the deterministic pre-route patterns.
         result = await run(message="what should I focus on today", **BASE)
 
     # 1) Supervisor reported tokens in the response — proves the per-request

@@ -667,16 +667,23 @@ async def run(
         conversation_store.clear_pending(thread)
         logger.info("supervisor dropped stale pending: reply was neither yes nor no")
 
-    # 2) Determine intent. Try the cheap deterministic pre-router first
-    # (item 12) — an unmistakable message ("show me all issues", a bare
-    # greeting) skips the paid LLM classify entirely. The pre-router never
-    # returns a WRITE (those need full entity extraction), so the write paths
-    # below are unaffected.
-    pre_routed = pre_route(message)
+    # 2) Determine intent. Try the LLM-based pre-router first — a confident
+    # read intent ("show me all issues", "what is Alice working on") skips
+    # the full ``classify`` call (which does entity extraction too) and goes
+    # straight to the read agent. The pre-router never returns a WRITE
+    # (those need full entity extraction that only classify() does), so the
+    # write paths below are unaffected. Empty / greetings short-circuit
+    # inside pre_route without an LLM call.
+    try:
+        pre_routed = await pre_route(message, callbacks=callbacks)
+    except Exception as e:
+        logger.warning("supervisor pre_route crashed, falling through to classify: {}", e)
+        pre_routed = None
     if pre_routed is not None:
         intent_result = pre_routed
         logger.info(
-            "supervisor pre-routed intent={} (no LLM call)", intent_result.intent.value
+            "supervisor pre-routed intent={} (LLM hit, skipped full classify)",
+            intent_result.intent.value,
         )
     else:
         # classify() never raises on a bad/parse response (it returns UNKNOWN),
