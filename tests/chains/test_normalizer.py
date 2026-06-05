@@ -104,6 +104,52 @@ def test_p1_keyword_sets_priority_high() -> None:
     assert out["priority"] == "high"
 
 
+# --- literal priority aliases set by the LLM --------------------------------
+# Regression for stress query #32 ("Add a P0 bug …") where the LLM put the
+# literal "P0" straight into entities['priority'] and the preview showed
+# "with P0 priority" instead of "critical". Canonicalization must fire even
+# when priority is already set, as long as the value is a known alias.
+
+
+def test_literal_p0_priority_is_canonicalized_to_critical() -> None:
+    out = normalize_entities("Add a P0 bug", {"type": "bug", "priority": "P0"})
+    assert out["priority"] == "critical"
+
+
+def test_literal_p1_priority_is_canonicalized_to_high() -> None:
+    out = normalize_entities("ship it", {"priority": "P1"})
+    assert out["priority"] == "high"
+
+
+def test_literal_p2_priority_is_canonicalized_to_medium() -> None:
+    out = normalize_entities("ship it", {"priority": "p2"})
+    assert out["priority"] == "medium"
+
+
+def test_literal_sev1_priority_is_canonicalized_to_critical() -> None:
+    out = normalize_entities("incident", {"priority": "Sev1"})
+    assert out["priority"] == "critical"
+
+
+def test_literal_important_priority_is_canonicalized_to_high() -> None:
+    out = normalize_entities("ship it", {"priority": "important"})
+    assert out["priority"] == "high"
+
+
+def test_canonical_priority_value_is_preserved_exactly() -> None:
+    """A value that is already canonical must pass through untouched (and not,
+    e.g., get re-derived from the message's keywords)."""
+    out = normalize_entities("this is urgent", {"priority": "low"})
+    assert out["priority"] == "low"
+
+
+def test_unrecognized_priority_literal_is_left_untouched() -> None:
+    """An unknown priority string is not a value we can safely map, so it is
+    left as-is rather than guessed at."""
+    out = normalize_entities("ship it", {"priority": "whenever"})
+    assert out["priority"] == "whenever"
+
+
 # --- no-trigger cases ------------------------------------------------------
 
 

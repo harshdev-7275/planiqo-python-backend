@@ -1,4 +1,3 @@
-import re
 from typing import Any
 
 from langchain_core.callbacks import Callbacks
@@ -7,7 +6,10 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import create_react_agent
 from loguru import logger
 
+from agents.react_utils import finalize, strip_think
 from agents.state import SupervisorState
+from chains.sanitize import INJECTION_GUARD
+from clients.embeddings import embedding_client
 from clients.llm_client import get_tool
 from clients.neo4j_client import neo4j_client
 from clients.node_api import node_api_client
@@ -33,17 +35,16 @@ _SYSTEM = (
     "backend stores it as a literal string and the assignment silently breaks. "
     "To change an issue's priority, title, or assignee use update_issue with the "
     "issue number (e.g. 5); use update_issue_status only for status changes. "
-    "Be concise. Respond in plain text after tool calls complete."
+    "If a tool result begins with 'Failed' or reports an error, tell the user you "
+    "couldn't reach the server — do NOT say there are no issues or that none were "
+    "found, because you don't actually know. "
+    "Be concise. Respond in plain text after tool calls complete. "
+    + INJECTION_GUARD
 )
 
-# Reasoning models (e.g. MiniMax-M2.7) wrap their final answer in
-# <think>…</think> before the user-visible content. Strip it everywhere an
-# agent's text surfaces to the user, or the scratchpad leaks into the chat.
-_THINK_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
-
-
-def _strip_think(text: str) -> str:
-    return _THINK_RE.sub("", text).strip()
+# Back-compat alias — the reasoning-scratchpad stripper now lives in
+# agents/react_utils so the read agents share one implementation.
+_strip_think = strip_think
 
 
 def _build_agent(
@@ -54,16 +55,20 @@ def _build_agent(
         GetIssuesTool(api=api, org_slug=org_slug, project_id=project_id),
         GetStatusesTool(api=api, org_slug=org_slug, project_id=project_id),
         CreateIssueTool(api=api, org_slug=org_slug, project_id=project_id,
-                        user_id=user_id, neo4j_client=neo4j_client),
+                        user_id=user_id, neo4j_client=neo4j_client,
+                        embedding_client=embedding_client),
         # change priority/title/assignee by issue number
-        UpdateIssueTool(api=api, org_slug=org_slug, project_id=project_id, user_id=user_id),
+        UpdateIssueTool(api=api, org_slug=org_slug, project_id=project_id,
+                        user_id=user_id, neo4j_client=neo4j_client,
+                        embedding_client=embedding_client),
         UpdateIssueStatusTool(api=api, org_slug=org_slug, project_id=project_id, user_id=user_id),
         # lets the model fulfill the "in Sprint X" preview
         AddIssueToSprintTool(api=api, org_slug=org_slug, project_id=project_id),
         # resolve "Alice" → user id before create_issue
         FindUserByNameTool(neo4j_client=neo4j_client, org_slug=org_slug, project_id=project_id),
         SuggestAssigneeTool(neo4j_client=neo4j_client, org_slug=org_slug, project_id=project_id),
-        FindSimilarIssuesTool(neo4j_client=neo4j_client, org_slug=org_slug, project_id=project_id),
+        FindSimilarIssuesTool(neo4j_client=neo4j_client, org_slug=org_slug,
+                              project_id=project_id, embedding_client=embedding_client),
     ]
     return create_react_agent(get_tool(), tools, prompt=_SYSTEM)
 
@@ -79,9 +84,10 @@ async def run(state: SupervisorState, callbacks: Callbacks = None) -> dict[str, 
     config: RunnableConfig | None = {"callbacks": callbacks} if callbacks else None
     response = await agent.ainvoke({"messages": state["messages"]}, config=config)
 
-    last_message = response["messages"][-1]
-    raw = last_message.content if hasattr(last_message, "content") else str(last_message)
-    content = _strip_think(str(raw))
+    # finalize strips the reasoning scratchpad AND, if a tool in the trace
+    # failed, makes the unreachable-server failure explicit so the user never
+    # reads an outage as "no issues found".
+    content = finalize(response["messages"])
 
     logger.info("issue_agent response='{}'", content[:120])
     return {"result": {"message": content}}

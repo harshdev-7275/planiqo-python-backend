@@ -318,6 +318,109 @@ async def test_create_issue_suggestion_failure_does_not_crash_tool():
     assert "7" in result   # issue created despite suggestion failure
 
 
+# --- incremental Neo4j sync (Sprint 2.1) ------------------------------------
+#
+# Before this change, a bot-created issue lived in Postgres but was
+# invisible to find_similar_issues and suggest_assignee until the next
+# nightly full_sync. The tool now upserts into Neo4j in the same request
+# so smart features are immediately consistent with the source of truth.
+
+
+@pytest.mark.asyncio
+async def test_create_issue_upserts_to_neo4j_after_post() -> None:
+    """After a successful POST, the tool must upsert the new issue to
+    Neo4j so find_similar_issues can see it immediately."""
+    from tools.issue_tools import CreateIssueTool
+
+    neo = MagicMock()
+    with patch("tools.issue_tools.upsert_issue", new=AsyncMock()) as mock_upsert:
+        tool = CreateIssueTool(api=_DEFAULT_API(), neo4j_client=neo, **CTX)
+        await tool._arun(title="Login crash", type="bug", priority="high")
+    mock_upsert.assert_awaited_once()
+    args = mock_upsert.await_args.args
+    # First arg is the neo4j client, second is the merged issue dict
+    # (body + Node response so the upsert has all the fields).
+    assert args[0] is neo
+    issue = args[1]
+    assert issue["title"] == "Login crash"
+    assert issue["type"] == "bug"
+    assert issue["priority"] == "high"
+    assert issue["number"] == 7
+
+
+@pytest.mark.asyncio
+async def test_create_issue_skips_upsert_when_no_neo4j_client() -> None:
+    """Without a neo4j_client injection, the tool must not try to call
+    graph.sync.upsert_issue — the bot is already running in fail-soft
+    mode (main.py) and the issue was still created in Postgres."""
+    from tools.issue_tools import CreateIssueTool
+
+    with patch("tools.issue_tools.upsert_issue", new=AsyncMock()) as mock_upsert:
+        tool = CreateIssueTool(api=_DEFAULT_API(), **CTX)  # no neo4j_client
+        result = await tool._arun(title="t")
+    mock_upsert.assert_not_called()
+    assert "7" in result   # issue was still created (default API returns #7)
+
+
+@pytest.mark.asyncio
+async def test_create_issue_upsert_failure_does_not_break_user_response() -> None:
+    """A Neo4j outage during incremental sync must NOT break the chat —
+    log and carry on. The issue was successfully created in Postgres;
+    the smart features can wait for the next full_sync."""
+    from tools.issue_tools import CreateIssueTool
+
+    neo = MagicMock()
+    with patch("tools.issue_tools.upsert_issue", new=AsyncMock(side_effect=Exception("neo4j down"))):
+        tool = CreateIssueTool(api=_DEFAULT_API(), neo4j_client=neo, **CTX)
+        result = await tool._arun(title="Login crash", type="bug")
+    assert "7" in result  # user-facing message still says "Created #7"
+
+
+@pytest.mark.asyncio
+async def test_update_issue_upserts_to_neo4j_after_patch() -> None:
+    """After a successful PATCH, the tool must upsert the updated issue
+    so the graph reflects the new priority / title / assignee."""
+    from tools.issue_tools import UpdateIssueTool
+
+    neo = MagicMock()
+    with patch("tools.issue_tools.upsert_issue", new=AsyncMock()) as mock_upsert:
+        tool = UpdateIssueTool(
+            api=_mock_api(
+                get_issues=AsyncMock(return_value=_UPD_ISSUES),
+                patch=AsyncMock(return_value={"number": 5, "title": "Login broken"}),
+            ),
+            neo4j_client=neo, **CTX,
+        )
+        await tool._arun(issue_number=5, priority="high")
+    mock_upsert.assert_awaited_once()
+    args = mock_upsert.await_args.args
+    assert args[0] is neo
+    # Pre-update row merged with the patch body — the new priority
+    # must be on the upsert, not the old "low".
+    assert args[1]["priority"] == "high"
+    assert args[1]["number"] == 5
+    assert args[1]["title"] == "Login broken"
+
+
+@pytest.mark.asyncio
+async def test_update_issue_upsert_failure_does_not_break_user_response() -> None:
+    """A Neo4j outage during an update's incremental sync must NOT break
+    the chat — same fail-soft rule as create."""
+    from tools.issue_tools import UpdateIssueTool
+
+    neo = MagicMock()
+    with patch("tools.issue_tools.upsert_issue", new=AsyncMock(side_effect=Exception("neo4j down"))):
+        tool = UpdateIssueTool(
+            api=_mock_api(
+                get_issues=AsyncMock(return_value=_UPD_ISSUES),
+                patch=AsyncMock(return_value={"number": 5}),
+            ),
+            neo4j_client=neo, **CTX,
+        )
+        result = await tool._arun(issue_number=5, priority="high")
+    assert "#5" in result  # user-facing message still says "Updated #5"
+
+
 # --- SuggestAssigneeTool ---
 
 @pytest.mark.asyncio
@@ -378,8 +481,10 @@ _SIMILAR = [
 
 @pytest.mark.asyncio
 async def test_find_similar_tool_returns_formatted_list():
+    # Sprint 2.2: the tool now routes through hybrid_similar_issues (the
+    # default noop embedding client yields a non-None zero vector).
     neo = MagicMock()
-    with patch("tools.issue_tools.find_similar_issues", new=AsyncMock(return_value=_SIMILAR)):
+    with patch("tools.issue_tools.hybrid_similar_issues", new=AsyncMock(return_value=_SIMILAR)):
         tool = FindSimilarIssuesTool(neo4j_client=neo, **CTX)
         result = await tool._arun(title="login page crash")
     assert "#2" in result
@@ -390,7 +495,7 @@ async def test_find_similar_tool_returns_formatted_list():
 @pytest.mark.asyncio
 async def test_find_similar_tool_returns_no_similar_when_empty():
     neo = MagicMock()
-    with patch("tools.issue_tools.find_similar_issues", new=AsyncMock(return_value=[])):
+    with patch("tools.issue_tools.hybrid_similar_issues", new=AsyncMock(return_value=[])):
         tool = FindSimilarIssuesTool(neo4j_client=neo, **CTX)
         result = await tool._arun(title="login page crash")
     assert "no similar" in result.lower()
@@ -399,9 +504,10 @@ async def test_find_similar_tool_returns_no_similar_when_empty():
 @pytest.mark.asyncio
 async def test_find_similar_tool_passes_title_and_project():
     neo = MagicMock()
-    with patch("tools.issue_tools.find_similar_issues", new=AsyncMock(return_value=[])) as mock_fn:
+    with patch("tools.issue_tools.hybrid_similar_issues", new=AsyncMock(return_value=[])) as mock_fn:
         tool = FindSimilarIssuesTool(neo4j_client=neo, org_slug="acme", project_id="proj-7")
         await tool._arun(title="login page crash")
+    # hybrid_similar_issues(neo4j_client, project_id, title, embedding, k=5)
     assert mock_fn.call_args[0][1] == "proj-7"
     assert mock_fn.call_args[0][2] == "login page crash"
 

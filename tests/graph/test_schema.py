@@ -1,7 +1,13 @@
 import pytest
 from unittest.mock import AsyncMock
 
-from graph.schema import CONSTRAINTS, NodeLabel, RelType, apply_constraints
+from graph.schema import (
+    CONSTRAINTS,
+    VECTOR_INDEXES,
+    NodeLabel,
+    RelType,
+    apply_constraints,
+)
 
 
 def test_node_labels_defined():
@@ -45,12 +51,21 @@ def test_constraints_cover_core_nodes():
     assert "Sprint" in combined
 
 
+def test_vector_indexes_are_valid_cypher_strings():
+    for stmt in VECTOR_INDEXES:
+        assert isinstance(stmt, str)
+        assert "CREATE VECTOR INDEX" in stmt
+        assert "IF NOT EXISTS" in stmt
+
+
 @pytest.mark.asyncio
 async def test_apply_constraints_runs_each_statement():
+    """All DDL statements (constraints + vector indexes) must run on
+    startup so the schema is fully present on first deploy."""
     mock_client = AsyncMock()
     mock_client.run = AsyncMock(return_value=[])
     await apply_constraints(mock_client)
-    assert mock_client.run.call_count == len(CONSTRAINTS)
+    assert mock_client.run.call_count == len(CONSTRAINTS) + len(VECTOR_INDEXES)
 
 
 @pytest.mark.asyncio
@@ -61,4 +76,5 @@ async def test_apply_constraints_uses_parameterised_calls():
     for call in mock_client.run.call_args_list:
         args = call[0]
         assert isinstance(args[0], str)
-        assert "CREATE CONSTRAINT" in args[0]
+        # Each statement is either a constraint or a vector index.
+        assert "CREATE CONSTRAINT" in args[0] or "CREATE VECTOR INDEX" in args[0]

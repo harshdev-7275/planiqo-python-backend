@@ -115,3 +115,33 @@ async def test_run_reports_when_no_sprint_found():
 async def test_run_requires_project_context():
     out = await run(_state({"sprint": "Sprint 2"}, project_id=None))
     assert "project" in out["result"]["message"].lower()
+
+
+# --- graceful degradation (Sprint 3.x) -------------------------------------
+#
+# The stress test caught summarize returning 500 when the Node API was
+# unreachable. The agent must NEVER crash the /chat endpoint — every
+# node_api call here can fail (org doesn't exist, network blip, etc.) and
+# the user must see a friendly message, not a 500.
+
+
+@pytest.mark.asyncio
+async def test_run_swallows_node_api_500_on_get_sprints() -> None:
+    """A 500 from get_sprints must NOT propagate out of the agent — it
+    returns a user-readable error message. Regression for stress-test
+    query #13 ("summarize sprint 2" → http_500 when the stress org
+    didn't exist)."""
+    with patch("agents.summarize_agent.node_api_client") as api:
+        api.get_sprints = AsyncMock(side_effect=Exception("500 from server"))
+        out = await run(_state({"sprint": "Sprint 2"}))
+    assert "couldn't" in out["result"]["message"].lower() or "server" in out["result"]["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_run_swallows_node_api_500_on_get_issues() -> None:
+    with patch("agents.summarize_agent.node_api_client") as api:
+        api.get_sprints = AsyncMock(return_value=[_SPRINT])
+        api.get_issues = AsyncMock(side_effect=Exception("500 from server"))
+        api.get_statuses = AsyncMock(return_value=_STATUSES)
+        out = await run(_state({"sprint": "Sprint 2"}))
+    assert "couldn't" in out["result"]["message"].lower() or "server" in out["result"]["message"].lower()

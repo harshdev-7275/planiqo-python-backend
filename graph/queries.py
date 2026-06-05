@@ -4,6 +4,13 @@ from loguru import logger
 
 from clients.neo4j_client import Neo4jClient
 
+# Recency decay (item 16): a same-type issue resolved within this many days
+# earns a bonus on top of the all-time weight, so recent expertise outranks
+# stale expertise without ignoring it entirely.
+_RECENCY_WINDOW_DAYS = 30
+_RESOLVED_WEIGHT = 3
+_RECENCY_BONUS = 2
+
 
 async def suggest_assignee(
     neo4j_client: Neo4jClient,
@@ -14,6 +21,7 @@ async def suggest_assignee(
     """
     Score each project member as a candidate assignee:
       +3 per resolved same-type issue they were assigned to
+      +2 extra per such issue resolved in the last 30 days (recency decay)
       +1 per comment on same-type issues
       -1 per currently open issue (load penalty)
     Returns list of {userId, score} sorted by score descending.
@@ -27,9 +35,18 @@ async def suggest_assignee(
         """
         MATCH (u:User)-[:ASSIGNED_TO]->(i:Issue)-[:IN_PROJECT]->(p:Project {id: $project_id})
         WHERE i.type = $issue_type AND i.completedAt IS NOT NULL
-        RETURN u.id AS userId, count(i) AS cnt
+        RETURN u.id AS userId,
+               count(i) AS cnt,
+               sum(CASE
+                     WHEN datetime(i.completedAt) >= datetime() - duration({days: $recent_days})
+                     THEN 1 ELSE 0
+                   END) AS recent_cnt
         """,
-        {"project_id": project_id, "issue_type": issue_type},
+        {
+            "project_id": project_id,
+            "issue_type": issue_type,
+            "recent_days": _RECENCY_WINDOW_DAYS,
+        },
     )
 
     commented = await neo4j_client.run(
@@ -65,7 +82,11 @@ async def suggest_assignee(
     names:  dict[str, str]   = {}
 
     for row in resolved:
-        scores[row["userId"]] = scores.get(row["userId"], 0.0) + row["cnt"] * 3
+        # All-time weight + a recency bonus. ``recent_cnt`` is absent from older
+        # callers/mocks, so default to 0 — backward compatible (the score then
+        # equals the previous all-time-only formula).
+        weight = row["cnt"] * _RESOLVED_WEIGHT + row.get("recent_cnt", 0) * _RECENCY_BONUS
+        scores[row["userId"]] = scores.get(row["userId"], 0.0) + weight
 
     for row in commented:
         scores[row["userId"]] = scores.get(row["userId"], 0.0) + row["cnt"]
@@ -112,6 +133,11 @@ async def find_similar_issues(
     Find issues in the project whose title shares meaningful words with the given title.
     Words of 3 chars or fewer are ignored as noise. Returns up to 5 results sorted by
     match count descending.
+
+    This is the LEGACY word-overlap path. New callers should use
+    ``hybrid_similar_issues`` (Sprint 2.2) which combines this pre-filter
+    with a vector kNN rerank for semantic match ("login fails" vs
+    "can't sign in").
     """
     words = [w.lower() for w in title.split() if len(w) > 3]
     if not words:
@@ -131,6 +157,64 @@ async def find_similar_issues(
     )
     logger.info("find_similar_issues project={} matches={}", project_id, len(results))
     return results
+
+
+async def hybrid_similar_issues(
+    neo4j_client: Neo4jClient,
+    project_id: str,
+    title: str,
+    embedding: list[float],
+    k: int = 5,
+) -> list[dict[str, Any]]:
+    """Find similar issues using a hybrid retrieval pattern (Sprint 2.2).
+
+    Step 1 (cheap): word-overlap pre-filter narrows the candidate set.
+    Step 2 (semantic): a ``db.index.vector.queryNodes`` call ranks the
+    candidates by cosine similarity to ``embedding``.
+
+    The pre-filter is what makes this practical on Aura Free: a naive
+    full-graph vector kNN would scan every issue; the word-overlap
+    narrows to O(handful) candidates first. If the pre-filter returns
+    nothing, we return the empty list — the vector kNN would also
+    return nothing, and we avoid the network round-trip.
+
+    Falls back to the word-overlap result on a vector-index error
+    (e.g. the index hasn't been created yet on a fresh deploy) — the
+    smart feature is best-effort, not blocking.
+    """
+    pre = await find_similar_issues(neo4j_client, project_id, title)
+    if not pre:
+        return []
+    candidate_ids = [row["id"] for row in pre]
+    try:
+        ranked = await neo4j_client.run(
+            """
+            CALL db.index.vector.queryNodes(
+                'issue_embedding', $k, $embedding
+            ) YIELD node AS i, score
+            WHERE i.id IN $candidate_ids
+              AND i.id IS NOT NULL
+            RETURN i.id AS id, i.number AS number, i.title AS title, score
+            ORDER BY score DESC
+            LIMIT $k
+            """,
+            {
+                "k": k,
+                "embedding": embedding,
+                "candidate_ids": candidate_ids,
+            },
+        )
+    except Exception as e:  # index missing or transient neo4j error
+        logger.warning(
+            "hybrid_similar: vector index query failed, returning pre-filter: {}",
+            e,
+        )
+        return pre
+    logger.info(
+        "hybrid_similar_issues project={} pre_filter={} vector_ranked={}",
+        project_id, len(pre), len(ranked),
+    )
+    return ranked
 
 
 async def get_expertise_map(
@@ -155,6 +239,55 @@ async def get_expertise_map(
         {"project_id": project_id},
     )
     logger.info("get_expertise_map project={} users={}", project_id, len(results))
+    return results
+
+
+async def blocked_issues_in_sprint(
+    neo4j_client: Neo4jClient,
+    sprint_id: str,
+) -> list[dict[str, Any]]:
+    """Issues in a sprint that are blocked by a still-incomplete blocker
+    (item 14). Answers "what's blocking sprint X". An issue blocked only by
+    already-completed work is NOT returned — that dependency is satisfied.
+
+    Returns ``[{number, title, blockers: [{number, title}, ...]}]`` ordered by
+    issue number.
+    """
+    results = await neo4j_client.run(
+        """
+        MATCH (blocker:Issue)-[:BLOCKS]->(i:Issue)-[:IN_SPRINT]->(s:Sprint {id: $sprint_id})
+        WHERE blocker.completedAt IS NULL
+        WITH i, collect({number: blocker.number, title: blocker.title}) AS blockers
+        RETURN i.number AS number, i.title AS title, blockers
+        ORDER BY i.number
+        """,
+        {"sprint_id": sprint_id},
+    )
+    logger.info("blocked_issues_in_sprint sprint={} blocked={}", sprint_id, len(results))
+    return results
+
+
+async def find_dependency_cycles(
+    neo4j_client: Neo4jClient,
+    project_id: str,
+) -> list[dict[str, Any]]:
+    """Detect circular BLOCKS dependencies in a project (item 14).
+
+    A cycle (A blocks B blocks … blocks A) is a planning error — nothing in it
+    can start. Returns one row per detected cycle: ``{cycle: [number, ...]}``.
+    The ``size(nodes(path)) <= 8`` bound keeps the variable-length match cheap
+    on Aura Free; deeper cycles are rare and still partially surfaced.
+    """
+    results = await neo4j_client.run(
+        """
+        MATCH path = (i:Issue)-[:BLOCKS*1..8]->(i)
+        WHERE (i)-[:IN_PROJECT]->(:Project {id: $project_id})
+        RETURN [n IN nodes(path) | n.number] AS cycle
+        LIMIT 25
+        """,
+        {"project_id": project_id},
+    )
+    logger.info("find_dependency_cycles project={} cycles={}", project_id, len(results))
     return results
 
 

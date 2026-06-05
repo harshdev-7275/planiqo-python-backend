@@ -14,14 +14,18 @@ from typing import Any
 
 from langchain_core.messages import BaseMessage
 
+from config.settings import settings
+
 # Hard cap on stored messages per thread, independent of the read window, so a
 # long-lived conversation can never grow without bound.
 _MAX_STORED_MESSAGES = 100
 
 # How long a pending action waits for confirmation before it is dropped. The
 # supervisor checks this on every read so a user who walks away does not leave
-# a stale proposal that hijacks the next unrelated message.
-DEFAULT_PENDING_TTL_SECONDS = 600.0
+# a stale proposal that hijacks the next unrelated message. Sourced from
+# settings (item 27) so it is configurable per deployment; kept exported under
+# this name for the callers/tests that reference the default.
+DEFAULT_PENDING_TTL_SECONDS = settings.PENDING_TTL_SECONDS
 
 
 class ConversationStore:

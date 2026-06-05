@@ -2,7 +2,12 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from graph.queries import (
-    find_similar_issues, find_user_by_name, get_expertise_map, suggest_assignee,
+    blocked_issues_in_sprint,
+    find_dependency_cycles,
+    find_similar_issues,
+    find_user_by_name,
+    get_expertise_map,
+    suggest_assignee,
 )
 
 
@@ -209,6 +214,94 @@ async def test_suggest_assignee_queries_are_parameterised():
         assert "proj-1" not in query
         assert "bug" not in query
         assert "fix login" not in query
+
+
+# --- recency decay (item 16) ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_suggest_assignee_recent_work_earns_bonus():
+    """A user with the same all-time count but recent work scores higher."""
+    neo = _neo4j(
+        [{"userId": "u1", "cnt": 2, "recent_cnt": 2}],   # 2*3 + 2*2 = 10
+        [],
+        [{"userId": "u1", "userName": "Alice", "open_count": 0}],
+    )
+    results = await suggest_assignee(neo, "proj-1", "title", "bug")
+    assert results[0]["score"] == 10.0
+
+
+@pytest.mark.asyncio
+async def test_suggest_assignee_recency_query_passes_window_param():
+    neo = _neo4j([], [], [])
+    await suggest_assignee(neo, "proj-1", "title", "bug")
+    resolved_call = neo.run.call_args_list[0]
+    query, params = resolved_call[0]
+    assert "duration" in query  # recency arithmetic is in the cypher
+    assert "recent_days" in params
+
+
+@pytest.mark.asyncio
+async def test_suggest_assignee_backward_compatible_without_recent_cnt():
+    """Older mocks/rows without recent_cnt still score by the all-time weight."""
+    neo = _neo4j(
+        [{"userId": "u1", "cnt": 2}],  # no recent_cnt key
+        [],
+        [{"userId": "u1", "userName": "Alice", "open_count": 0}],
+    )
+    results = await suggest_assignee(neo, "proj-1", "title", "bug")
+    assert results[0]["score"] == 6.0
+
+
+# --- blocked_issues_in_sprint (item 14) -------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_blocked_issues_in_sprint_returns_rows():
+    expected = [{"number": 5, "title": "Deploy", "blockers": [{"number": 3, "title": "Migrate DB"}]}]
+    neo = _neo4j(expected)
+    results = await blocked_issues_in_sprint(neo, "sprint-1")
+    assert results == expected
+
+
+@pytest.mark.asyncio
+async def test_blocked_issues_in_sprint_only_incomplete_blockers():
+    neo = _neo4j([])
+    await blocked_issues_in_sprint(neo, "sprint-1")
+    query, params = neo.run.call_args[0]
+    assert "BLOCKS" in query
+    assert "completedAt IS NULL" in query  # satisfied (completed) blockers excluded
+    assert params["sprint_id"] == "sprint-1"
+
+
+@pytest.mark.asyncio
+async def test_blocked_issues_in_sprint_is_parameterised():
+    neo = _neo4j([])
+    await blocked_issues_in_sprint(neo, "sprint-99")
+    query, _ = neo.run.call_args[0]
+    assert "sprint-99" not in query
+    assert "$sprint_id" in query
+
+
+# --- find_dependency_cycles (item 14) ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_find_dependency_cycles_returns_rows():
+    expected = [{"cycle": [1, 2, 3, 1]}]
+    neo = _neo4j(expected)
+    results = await find_dependency_cycles(neo, "proj-1")
+    assert results == expected
+
+
+@pytest.mark.asyncio
+async def test_find_dependency_cycles_uses_variable_length_blocks():
+    neo = _neo4j([])
+    await find_dependency_cycles(neo, "proj-1")
+    query, params = neo.run.call_args[0]
+    assert "BLOCKS*" in query  # variable-length path
+    assert params["project_id"] == "proj-1"
+    assert "proj-1" not in query
 
 
 # ---------------------------------------------------------------------------

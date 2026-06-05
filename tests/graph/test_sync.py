@@ -7,8 +7,10 @@ from graph.sync import (
     upsert_change_activity,
     upsert_comment_activity,
     upsert_issue,
+    upsert_label,
     upsert_member,
     upsert_project,
+    upsert_sprint,
     upsert_user,
 )
 
@@ -24,6 +26,9 @@ def _neo4j():
 
 def _api(**kwargs):
     m = MagicMock()
+    # full_sync now also fetches sprints (item 15) — default to empty so tests
+    # that don't care about sprints don't have to mock the method.
+    kwargs.setdefault("get_sprints", [])
     for method, value in kwargs.items():
         setattr(m, method, AsyncMock(return_value=value))
     return m
@@ -348,6 +353,98 @@ async def test_tombstone_returns_zero_on_empty_neo4j_result():
     neo = MagicMock()
     neo.run = AsyncMock(return_value=[])
     assert await tombstone_missing_members(neo, "proj-1", {"u1"}) == 0
+
+
+# ---------------------------------------------------------------------------
+# upsert_label / upsert_sprint (item 15)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upsert_label_merges_node():
+    neo = _neo4j()
+    await upsert_label(neo, {"id": "lbl-1", "name": "backend"})
+    query, params = neo.run.call_args[0]
+    assert "MERGE" in query and "Label" in query
+    assert params["id"] == "lbl-1"
+    assert params["name"] == "backend"
+
+
+@pytest.mark.asyncio
+async def test_upsert_sprint_sets_metadata():
+    neo = _neo4j()
+    await upsert_sprint(neo, {
+        "id": "sprint-1", "name": "Q3 Hardening", "status": "active",
+        "startDate": "2026-06-01", "endDate": "2026-06-14",
+    })
+    query, params = neo.run.call_args[0]
+    assert "MERGE" in query and "Sprint" in query
+    assert params["name"] == "Q3 Hardening"
+    assert params["status"] == "active"
+    assert params["startDate"] == "2026-06-01"
+
+
+# ---------------------------------------------------------------------------
+# upsert_issue — labels + BLOCKS (items 14/15)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upsert_issue_creates_has_label_edges():
+    neo = _neo4j()
+    issue = {**_ISSUE_MINIMAL, "labels": [{"id": "lbl-1", "name": "backend"}]}
+    await upsert_issue(neo, issue)
+    queries = [c[0][0] for c in neo.run.call_args_list]
+    assert any("HAS_LABEL" in q for q in queries)
+    assert any("Label" in q and "MERGE" in q for q in queries)
+
+
+@pytest.mark.asyncio
+async def test_upsert_issue_creates_blocks_edges():
+    neo = _neo4j()
+    issue = {**_ISSUE_MINIMAL, "blocks": ["issue-9"]}
+    await upsert_issue(neo, issue)
+    blocks_calls = [c for c in neo.run.call_args_list if "BLOCKS" in c[0][0]]
+    assert blocks_calls, "expected a BLOCKS edge"
+    # The edge direction is (this)-[:BLOCKS]->(blocked).
+    params = blocks_calls[0][0][1]
+    assert params["issue_id"] == "issue-2"
+    assert params["blocked_id"] == "issue-9"
+
+
+@pytest.mark.asyncio
+async def test_upsert_issue_creates_reverse_blocks_for_blockedby():
+    neo = _neo4j()
+    issue = {**_ISSUE_MINIMAL, "blockedBy": ["issue-7"]}
+    await upsert_issue(neo, issue)
+    blocks_calls = [c for c in neo.run.call_args_list if "BLOCKS" in c[0][0]]
+    assert blocks_calls
+    params = blocks_calls[0][0][1]
+    # blockedBy => (blocker)-[:BLOCKS]->(this)
+    assert params["blocker_id"] == "issue-7"
+
+
+@pytest.mark.asyncio
+async def test_upsert_issue_without_labels_or_blocks_adds_no_extra_edges():
+    """Backward compat: an issue with neither key must not emit label/blocks
+    cypher (so the full_sync path is unchanged)."""
+    neo = _neo4j()
+    await upsert_issue(neo, _ISSUE_MINIMAL)
+    queries = [c[0][0] for c in neo.run.call_args_list]
+    assert not any("HAS_LABEL" in q for q in queries)
+    assert not any("BLOCKS" in q for q in queries)
+
+
+@pytest.mark.asyncio
+async def test_full_sync_upserts_sprints():
+    neo = _neo4j()
+    api = _api(
+        get_projects=_PROJECTS, get_project_members=[], get_issues=[],
+        get_sprints=[{"id": "sprint-1", "name": "Q3", "status": "active"}],
+    )
+    await full_sync(neo, api, "acme")
+    queries = [c[0][0] for c in neo.run.call_args_list]
+    assert any("Sprint" in q and "MERGE" in q and "status" in q for q in queries)
 
 
 # ---------------------------------------------------------------------------

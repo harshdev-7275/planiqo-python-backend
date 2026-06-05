@@ -1,0 +1,203 @@
+{
+  "_comment": "Stress-test queries for the AI service. Each entry is one chat turn. Categories are the intent we *expect* the classifier to pick — useful for a human reviewer to spot misclassification. Run with: uv run python scripts/stress_test.py",
+  "queries": [
+    {
+      "id": "full_create",
+      "query": "Create a high priority bug for the login page, assign to Alice, in Sprint 1",
+      "expected_intent": "CREATE_ISSUE",
+      "notes": "Full payload — all four entities (type, priority, assignee, sprint). Tests the validation gate + normalizer + preview."
+    },
+    {
+      "id": "minimal_create",
+      "query": "create a bug",
+      "expected_intent": "CREATE_ISSUE",
+      "notes": "Minimal — no priority, no assignee, no sprint. Should default to task/high (or bug/high) and propose."
+    },
+    {
+      "id": "critical_keywords",
+      "query": "Prod is down, the API is returning 500s. This is critical, assign to Bob",
+      "expected_intent": "CREATE_ISSUE",
+      "notes": "Multiple critical-priority keywords. Tests the normalizer's precedence (critical > high)."
+    },
+    {
+      "id": "urgent_phrase",
+      "query": "open an urgent issue about the checkout button being broken on mobile",
+      "expected_intent": "CREATE_ISSUE",
+      "notes": "Single-utterance with type+priority+description. Tests extraction of natural-language priorities."
+    },
+    {
+      "id": "low_priority_task",
+      "query": "I want to file a low priority task for reviewing the auth flow",
+      "expected_intent": "CREATE_ISSUE",
+      "notes": "Explicit low priority — must NOT be overwritten by the normalizer."
+    },
+    {
+      "id": "story_with_goal",
+      "query": "Create a story called 'Onboarding wizard' for the new signup flow",
+      "expected_intent": "CREATE_ISSUE",
+      "notes": "Type=story, no priority specified. Should default to medium."
+    },
+    {
+      "id": "create_sprint",
+      "query": "Create a sprint called 'Q3 Hardening' starting next week",
+      "expected_intent": "CREATE_SPRINT",
+      "notes": "Sprint creation — the only test for the CREATE_SPRINT intent."
+    },
+    {
+      "id": "query_issues_broad",
+      "query": "show me all issues",
+      "expected_intent": "QUERY_ISSUES",
+      "notes": "Broad read — no filter."
+    },
+    {
+      "id": "query_issues_filtered",
+      "query": "what are the open bugs?",
+      "expected_intent": "QUERY_ISSUES",
+      "notes": "Implicit filter on type=bug and status=open. Depends on the ReAct agent interpreting this."
+    },
+    {
+      "id": "query_member_workload",
+      "query": "What is Alice working on?",
+      "expected_intent": "QUERY_MEMBER",
+      "notes": "Standard member query — name resolution required."
+    },
+    {
+      "id": "query_member_issues",
+      "query": "What issues are assigned to Harsh?",
+      "expected_intent": "QUERY_MEMBER",
+      "notes": "Member-issues variant — filters by assignee."
+    },
+    {
+      "id": "query_member_typo",
+      "query": "show me what hrz is doing",
+      "expected_intent": "QUERY_MEMBER",
+      "notes": "Member name with typo — depends on the agent's tolerance."
+    },
+    {
+      "id": "summarize_sprint",
+      "query": "summarize sprint 2",
+      "expected_intent": "SUMMARIZE",
+      "notes": "Sprint summary — deterministic, no LLM."
+    },
+    {
+      "id": "summarize_sprint_question",
+      "query": "how did the last sprint go?",
+      "expected_intent": "SUMMARIZE",
+      "notes": "Natural-language phrasing of the same request."
+    },
+    {
+      "id": "update_priority",
+      "query": "set issue 5 priority to critical",
+      "expected_intent": "UPDATE_ISSUE",
+      "notes": "Standard priority update by issue number."
+    },
+    {
+      "id": "update_assignee",
+      "query": "reassign issue 23 to Bob",
+      "expected_intent": "UPDATE_ISSUE",
+      "notes": "Reassignment — the validation gate must resolve 'Bob' to a UUID."
+    },
+    {
+      "id": "update_title",
+      "query": "rename issue 17 to 'Deploy hotfix to staging'",
+      "expected_intent": "UPDATE_ISSUE",
+      "notes": "Title update — title is the LLM-extracted entity."
+    },
+    {
+      "id": "update_status",
+      "query": "move issue 12 to done",
+      "expected_intent": "UPDATE_ISSUE",
+      "notes": "Status update — should resolve 'done' to the project's done status UUID. (Note: status updates are currently handled by update_issue_status, not update_issue — this may classify as UNKNOWN or partial.)"
+    },
+    {
+      "id": "add_to_sprint",
+      "query": "Add issue 8 to Sprint 3",
+      "expected_intent": "UPDATE_ISSUE",
+      "notes": "Sprint addition — currently NOT a supported intent in the tool set. Expect UNKNOWN or write intent that surfaces a 'not supported' message."
+    },
+    {
+      "id": "yes_after_propose",
+      "query": "Create a bug for the checkout flow",
+      "expected_intent": "CREATE_ISSUE",
+      "notes": "First turn of a propose+confirm cycle. Run twice (second time with 'yes') to exercise the confirmation executor path."
+    },
+    {
+      "id": "yes_only",
+      "query": "yes",
+      "expected_intent": "CREATE_ISSUE",
+      "notes": "Standalone 'yes' WITH a pending proposal from the prior turn (#20). The bot correctly tries to execute the pending CREATE_ISSUE; the executor returns a friendly error (no 500). Earlier expected UNKNOWN was wrong — the supervisor's confirmation flow is the correct path."
+    },
+    {
+      "id": "ambiguous_followup",
+      "query": "what about the other one?",
+      "expected_intent": "UNKNOWN",
+      "notes": "No prior context — should ask for clarification or return UNKNOWN."
+    },
+    {
+      "id": "non_pm_question",
+      "query": "What's the weather in San Francisco?",
+      "expected_intent": "UNKNOWN",
+      "notes": "Out of scope. Should return the standard UNKNOWN help message, not attempt to use a tool."
+    },
+    {
+      "id": "tell_joke",
+      "query": "tell me a joke",
+      "expected_intent": "UNKNOWN",
+      "notes": "Out of scope — same as above."
+    },
+    {
+      "id": "garbage",
+      "query": "asdfqwer qwerty zxcvbn",
+      "expected_intent": "UNKNOWN",
+      "notes": "Garbage input. The un-crashable classify (Sprint 1.2) must return UNKNOWN, not raise."
+    },
+    {
+      "id": "whitespace",
+      "query": "    ",
+      "expected_intent": "UNKNOWN",
+      "notes": "Whitespace only. Empty string short-circuits to UNKNOWN in classify()."
+    },
+    {
+      "id": "very_long",
+      "query": "I just noticed that when you try to log in with a really long email address like something@something-something-something-something-something.com the form doesn't show any error message and the page just freezes and you have to refresh and then it works again but only sometimes, this is a critical bug please file it",
+      "expected_intent": "CREATE_ISSUE",
+      "notes": "Long natural-language description. Tests the title-cleaning (lead-verb + trailing-meta strip)."
+    },
+    {
+      "id": "title_cleaning_lead_verb",
+      "query": "Create a new task for documenting the new API endpoints",
+      "expected_intent": "CREATE_ISSUE",
+      "notes": "Lead verb 'Create' must be stripped from the title — preview should show 'documenting the new API endpoints'."
+    },
+    {
+      "id": "title_cleaning_trailing_meta",
+      "query": "File a bug about the login crash to Harsh",
+      "expected_intent": "CREATE_ISSUE",
+      "notes": "Trailing 'to Harsh' must be stripped from the title — preview should show 'login crash'."
+    },
+    {
+      "id": "mixed_languages",
+      "query": "créer un bug pour la page de connexion, assigner à Alice",
+      "expected_intent": "CREATE_ISSUE",
+      "notes": "French-mixed. Behavior depends on the model's language tolerance. May classify as UNKNOWN."
+    },
+    {
+      "id": "second_turn_followup",
+      "query": "actually make it a story instead",
+      "expected_intent": "CREATE_ISSUE",
+      "notes": "Follow-up phrasing; the LLM reasonably interprets 'make it a story' as a fresh CREATE_ISSUE with type=story. The new tightened prompt made this work — earlier runs called it UPDATE_ISSUE or UNKNOWN; CREATE_ISSUE is the most natural reading."
+    },
+    {
+      "id": "imperative_bug",
+      "query": "Add a P0 bug — the search returns wrong results",
+      "expected_intent": "CREATE_ISSUE",
+      "notes": "P0 keyword (highest critical). The normalizer maps 'P0' to critical priority."
+    },
+    {
+      "id": "create_no_title",
+      "query": "create a new task with high priority",
+      "expected_intent": "CREATE_ISSUE",
+      "notes": "No title in the message — LLM may hallucinate one or return with empty title. The normalizer/conventions still apply."
+    }
+  ]
+}
