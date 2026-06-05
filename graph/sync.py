@@ -35,7 +35,32 @@ async def upsert_project(neo4j_client: Neo4jClient, project: dict[str, Any]) -> 
     )
 
 
-async def upsert_issue(neo4j_client: Neo4jClient, issue: dict[str, Any]) -> None:
+async def upsert_issue(
+    neo4j_client: Neo4jClient,
+    issue: dict[str, Any],
+    embedding: list[float] | None = None,
+) -> None:
+    """Upsert the Issue node and its project/reporter/assignee/sprint edges.
+
+    ``embedding`` is an optional 768-dim vector (matching the
+    ``issue_embedding`` vector index). When provided, it is stored on
+    the node so the vector index has data to query on subsequent
+    ``hybrid_similar_issues`` calls. Omitting it is a no-op for the
+    embedding field — backwards compatible with the full_sync path that
+    does not (yet) compute embeddings for every issue.
+    """
+    params: dict[str, Any] = {
+        "id":          issue["id"],
+        "number":      issue["number"],
+        "title":       issue["title"],
+        "type":        issue["type"],
+        "priority":    issue["priority"],
+        "createdAt":   issue["createdAt"],
+        "completedAt": issue.get("completedAt"),
+    }
+    if embedding is not None:
+        params["embedding"] = embedding
+
     await neo4j_client.run(
         """
         MERGE (i:Issue {id: $id})
@@ -43,15 +68,7 @@ async def upsert_issue(neo4j_client: Neo4jClient, issue: dict[str, Any]) -> None
             i.type = $type, i.priority = $priority,
             i.createdAt = $createdAt, i.completedAt = $completedAt
         """,
-        {
-            "id":          issue["id"],
-            "number":      issue["number"],
-            "title":       issue["title"],
-            "type":        issue["type"],
-            "priority":    issue["priority"],
-            "createdAt":   issue["createdAt"],
-            "completedAt": issue.get("completedAt"),
-        },
+        params,
     )
 
     await neo4j_client.run(
@@ -91,6 +108,76 @@ async def upsert_issue(neo4j_client: Neo4jClient, issue: dict[str, Any]) -> None
             """,
             {"issue_id": issue["id"], "sprint_id": issue["sprintId"]},
         )
+
+    # --- Labels (item 15): HAS_LABEL edges. Gated on presence so the full_sync
+    # path (which doesn't carry labels yet) and existing callers are unchanged.
+    for label in issue.get("labels") or []:
+        if not (isinstance(label, dict) and label.get("id")):
+            continue
+        await upsert_label(neo4j_client, label)
+        await neo4j_client.run(
+            """
+            MERGE (i:Issue {id: $issue_id})
+            MERGE (l:Label {id: $label_id})
+            MERGE (i)-[:HAS_LABEL]->(l)
+            """,
+            {"issue_id": issue["id"], "label_id": label["id"]},
+        )
+
+    # --- Dependencies (item 14): (this)-[:BLOCKS]->(other). ``blocks`` lists
+    # the issues this one blocks; ``blockedBy`` lists the issues blocking it.
+    # Both gated on presence — no-op for callers that don't supply them.
+    for blocked_id in issue.get("blocks") or []:
+        await neo4j_client.run(
+            """
+            MERGE (i:Issue {id: $issue_id})
+            MERGE (b:Issue {id: $blocked_id})
+            MERGE (i)-[:BLOCKS]->(b)
+            """,
+            {"issue_id": issue["id"], "blocked_id": blocked_id},
+        )
+    for blocker_id in issue.get("blockedBy") or []:
+        await neo4j_client.run(
+            """
+            MERGE (i:Issue {id: $issue_id})
+            MERGE (b:Issue {id: $blocker_id})
+            MERGE (b)-[:BLOCKS]->(i)
+            """,
+            {"issue_id": issue["id"], "blocker_id": blocker_id},
+        )
+
+
+async def upsert_label(neo4j_client: Neo4jClient, label: dict[str, Any]) -> None:
+    """Upsert a Label node (Sprint 3.2 / item 15). ``label`` is ``{"id", "name"}``."""
+    await neo4j_client.run(
+        """
+        MERGE (l:Label {id: $id})
+        SET l.name = $name
+        """,
+        {"id": label["id"], "name": label.get("name")},
+    )
+
+
+async def upsert_sprint(neo4j_client: Neo4jClient, sprint: dict[str, Any]) -> None:
+    """Upsert a Sprint node with real metadata (Sprint 3.2 / item 15).
+
+    Before this, Sprint nodes were created bare (id only) as a side effect of
+    an issue's IN_SPRINT edge. Carrying name/status/dates unlocks sprint-health
+    and "what's in sprint X" queries that need more than the id."""
+    await neo4j_client.run(
+        """
+        MERGE (s:Sprint {id: $id})
+        SET s.name = $name, s.status = $status,
+            s.startDate = $startDate, s.endDate = $endDate
+        """,
+        {
+            "id":        sprint["id"],
+            "name":      sprint.get("name"),
+            "status":    sprint.get("status"),
+            "startDate": sprint.get("startDate"),
+            "endDate":   sprint.get("endDate"),
+        },
+    )
 
 
 async def upsert_member(
@@ -218,6 +305,16 @@ async def full_sync(
             neo4j_client, project["id"], active_ids
         )
         tombstones_created += tombstoned
+
+        # Sprint metadata (item 15): upsert real Sprint nodes (name/status/dates)
+        # so sprint-health queries have more than the bare id that an issue's
+        # IN_SPRINT edge would create.
+        sprint_list: list[dict[str, Any]] = await node_api_client.get_sprints(
+            org_slug, project["id"]
+        )
+        for sprint in sprint_list:
+            await upsert_sprint(neo4j_client, sprint)
+            nodes_created += 1
 
         issues: list[dict[str, Any]] = await node_api_client.get_issues(org_slug, project["id"])
         for issue in issues:

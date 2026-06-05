@@ -1,4 +1,3 @@
-import re
 from typing import Any
 
 from langchain_core.callbacks import Callbacks
@@ -7,7 +6,9 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import create_react_agent
 from loguru import logger
 
+from agents.react_utils import finalize, strip_think
 from agents.state import SupervisorState
+from chains.sanitize import INJECTION_GUARD
 from clients.llm_client import get_tool
 from clients.node_api import node_api_client
 from tools.member_tools import ListMembersTool, MemberIssuesTool
@@ -17,17 +18,15 @@ _SYSTEM = (
     "Use tools to answer questions about team members: list_members for who is "
     "on the team, member_issues to see what a specific person is working on. "
     "Tools already know the project context — do not ask for org or project details. "
-    "Be concise. Respond in plain text after tool calls complete."
+    "If a tool result begins with 'Failed' or reports an error, tell the user you "
+    "couldn't reach the server — do NOT claim the person has no issues or that "
+    "nobody was found, because you don't actually know. "
+    "Be concise. Respond in plain text after tool calls complete. "
+    + INJECTION_GUARD
 )
 
-# Reasoning models (e.g. MiniMax-M2.7) wrap their final answer in
-# <think>…</think> before the user-visible content. Strip it everywhere an
-# agent's text surfaces to the user, or the scratchpad leaks into the chat.
-_THINK_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
-
-
-def _strip_think(text: str) -> str:
-    return _THINK_RE.sub("", text).strip()
+# Back-compat alias — the shared stripper lives in agents/react_utils.
+_strip_think = strip_think
 
 
 def _build_agent(org_slug: str, project_id: str) -> CompiledStateGraph[Any, None, Any, Any]:
@@ -49,9 +48,9 @@ async def run(state: SupervisorState, callbacks: Callbacks = None) -> dict[str, 
     config: RunnableConfig | None = {"callbacks": callbacks} if callbacks else None
     response = await agent.ainvoke({"messages": state["messages"]}, config=config)
 
-    last_message = response["messages"][-1]
-    raw = last_message.content if hasattr(last_message, "content") else str(last_message)
-    content = _strip_think(str(raw))
+    # finalize strips the reasoning scratchpad AND surfaces an unreachable
+    # server explicitly, so an outage is never reported as "no one found".
+    content = finalize(response["messages"])
 
     logger.info("member_agent response='{}'", content[:120])
     return {"result": {"message": content}}

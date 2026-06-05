@@ -1,3 +1,4 @@
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -11,8 +12,10 @@ from agents import supervisor
 from clients.neo4j_client import neo4j_client
 from clients.node_api import node_api_client
 from config.settings import settings
+from graph.events import apply_event
 from graph.schema import apply_constraints
 from graph.sync import full_sync
+from metering.metrics import latency_stats
 from metering.usage import usage_store
 from middleware.auth import InternalAuthMiddleware
 
@@ -26,6 +29,17 @@ class ChatRequest(BaseModel):
 
 class SyncRequest(BaseModel):
     org_slug: str
+
+
+class GraphEvent(BaseModel):
+    """One entity-change pushed by the node-backend on a direct REST write.
+
+    ``entity`` is one of graph.events.SUPPORTED_ENTITIES; ``data`` carries the
+    fields the matching sync function needs (shaped like the bot-route response
+    for that entity)."""
+
+    entity: str
+    data: dict[str, Any]
 
 
 @asynccontextmanager
@@ -82,6 +96,17 @@ async def graph_sync(body: SyncRequest) -> dict[str, int]:
     )
 
 
+@app.post("/graph/events")
+async def graph_events(body: GraphEvent) -> dict[str, Any]:
+    """Apply a single incremental entity change to the graph.
+
+    Fired by the node-backend on direct (non-bot) REST writes so the graph
+    stays in step with Postgres between full syncs. Best-effort: always 200,
+    with ``ok: false`` in the body if the graph is unavailable or the payload
+    is unknown — the caller does not block its user-facing write on this."""
+    return await apply_event(neo4j_client, body.entity, body.data)
+
+
 @app.get("/admin/usage/{org_slug}")
 async def admin_usage(org_slug: str) -> dict[str, Any]:
     """Per-org token usage + request count. Internal-only (the auth middleware
@@ -94,11 +119,26 @@ async def admin_usage(org_slug: str) -> dict[str, Any]:
     }
 
 
+@app.get("/metrics")
+async def metrics() -> dict[str, Any]:
+    """Ops snapshot: per-org token/request usage + /chat latency aggregates.
+    Internal-only (behind the auth middleware) — for dashboards/scrapers, not
+    the frontend."""
+    return {
+        "usage": usage_store.snapshot(),
+        "latency": latency_stats.snapshot(),
+    }
+
+
 @app.post("/chat")
 async def chat(body: ChatRequest) -> dict[str, Any]:
-    return await supervisor.run(
-        message=body.message,
-        user_id=body.user_id,
-        org_slug=body.org_slug,
-        project_id=body.project_id,
-    )
+    start = time.perf_counter()
+    try:
+        return await supervisor.run(
+            message=body.message,
+            user_id=body.user_id,
+            org_slug=body.org_slug,
+            project_id=body.project_id,
+        )
+    finally:
+        latency_stats.record((time.perf_counter() - start) * 1000)

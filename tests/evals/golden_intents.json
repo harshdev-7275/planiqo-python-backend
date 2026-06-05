@@ -1,0 +1,38 @@
+{
+  "_comment": "Golden intent-classification set (item 21). Each entry is a message + the intent the classifier MUST return. Curated to be unambiguous — phrasings whose intent is genuinely model-dependent (mixed-language, contextless follow-ups) are intentionally excluded so a dip in accuracy means a real regression, not dataset noise. Run the gate with: uv run pytest tests/evals -m integration",
+  "cases": [
+    {"query": "Create a high priority bug for the login page", "expected": "CREATE_ISSUE"},
+    {"query": "open an urgent issue about the checkout button being broken on mobile", "expected": "CREATE_ISSUE"},
+    {"query": "I want to file a low priority task for reviewing the auth flow", "expected": "CREATE_ISSUE"},
+    {"query": "Add a P0 bug — the search returns wrong results", "expected": "CREATE_ISSUE"},
+    {"query": "File a bug about the login crash", "expected": "CREATE_ISSUE"},
+    {"query": "log a bug: the export button does nothing", "expected": "CREATE_ISSUE"},
+    {"query": "Create a story called 'Onboarding wizard' for the new signup flow", "expected": "CREATE_ISSUE"},
+
+    {"query": "Create a sprint called 'Q3 Hardening' starting next week", "expected": "CREATE_SPRINT"},
+    {"query": "start a new sprint for the mobile team", "expected": "CREATE_SPRINT"},
+
+    {"query": "show me all issues", "expected": "QUERY_ISSUES"},
+    {"query": "what are the open bugs?", "expected": "QUERY_ISSUES"},
+    {"query": "list the high priority issues", "expected": "QUERY_ISSUES"},
+
+    {"query": "What is Alice working on?", "expected": "QUERY_MEMBER"},
+    {"query": "What issues are assigned to Harsh?", "expected": "QUERY_MEMBER"},
+    {"query": "who is working on the payments feature", "expected": "QUERY_MEMBER"},
+
+    {"query": "what's the status of the current sprint", "expected": "QUERY_SPRINT"},
+    {"query": "how is sprint 3 going", "expected": "QUERY_SPRINT"},
+
+    {"query": "summarize sprint 2", "expected": "SUMMARIZE"},
+    {"query": "how did the last sprint go?", "expected": "SUMMARIZE"},
+    {"query": "give me a recap of sprint 4", "expected": "SUMMARIZE"},
+
+    {"query": "set issue 5 priority to critical", "expected": "UPDATE_ISSUE"},
+    {"query": "reassign issue 23 to Bob", "expected": "UPDATE_ISSUE"},
+    {"query": "rename issue 17 to 'Deploy hotfix to staging'", "expected": "UPDATE_ISSUE"},
+
+    {"query": "What's the weather in San Francisco?", "expected": "UNKNOWN"},
+    {"query": "tell me a joke", "expected": "UNKNOWN"},
+    {"query": "asdfqwer qwerty zxcvbn", "expected": "UNKNOWN"}
+  ]
+}

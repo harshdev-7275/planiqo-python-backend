@@ -107,19 +107,53 @@ async def run(state: SupervisorState, callbacks: Callbacks = None) -> dict[str, 
 
     logger.info("summarize_agent org={} project={} query={}", org_slug, project_id, query)
 
-    sprints = await node_api_client.get_sprints(org_slug, project_id)
+    # Sprint 3.x: wrap every node_api call in try/except so a 500 (org
+    # doesn't exist, network blip, transient outage) surfaces a friendly
+    # user message instead of crashing the /chat endpoint. The stress test
+    # caught this as a regression: query #13 ("summarize sprint 2") 500'd.
+    try:
+        sprints = await node_api_client.get_sprints(org_slug, project_id)
+    except Exception as e:
+        logger.warning("summarize_agent: get_sprints failed: {}", e)
+        return {"result": {"message": (
+            "I couldn't fetch the project's sprints right now — the server "
+            "is unreachable. Please try again in a moment."
+        )}}
     sprint = _resolve_sprint(sprints, query)
     if sprint is None:
-        sprint = await node_api_client.get_active_sprint(org_slug, project_id)
+        try:
+            sprint = await node_api_client.get_active_sprint(org_slug, project_id)
+        except Exception as e:
+            logger.warning("summarize_agent: get_active_sprint failed: {}", e)
+            return {"result": {"message": (
+                "I couldn't find a sprint to summarize. Try naming one "
+                "(e.g. 'summarize Sprint 2') or start a sprint so there's "
+                "an active one."
+            )}}
     if sprint is None:
         return {"result": {"message": (
             "I couldn't find a sprint to summarize. Try naming one (e.g. "
             "'summarize Sprint 2') or start a sprint so there's an active one."
         )}}
 
-    issues = await node_api_client.get_issues(org_slug, project_id)
+    try:
+        issues = await node_api_client.get_issues(org_slug, project_id)
+    except Exception as e:
+        logger.warning("summarize_agent: get_issues failed: {}", e)
+        return {"result": {"message": (
+            "I found the sprint but couldn't fetch its issues — the server "
+            "is unreachable. Please try again in a moment."
+        )}}
     sprint_issues = [i for i in issues if i.get("sprintId") == sprint.get("id")]
-    statuses = await node_api_client.get_statuses(org_slug, project_id)
+    try:
+        statuses = await node_api_client.get_statuses(org_slug, project_id)
+    except Exception as e:
+        logger.warning("summarize_agent: get_statuses failed: {}", e)
+        return {"result": {"message": (
+            "I found the sprint and its issues but couldn't fetch the "
+            "project's statuses. The summary is unavailable until the "
+            "server recovers."
+        )}}
 
     summary = _format_sprint_summary(sprint, sprint_issues, statuses)
     logger.info("summarize_agent summarized '{}' ({} issues)", sprint.get("name"), len(sprint_issues))

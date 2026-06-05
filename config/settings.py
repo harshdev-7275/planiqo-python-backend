@@ -62,11 +62,28 @@ class Settings(BaseSettings):
     MAX_TOKENS_PER_REQUEST: int = 5000
     GROQ_RATE_LIMIT_RPM: int = 28
 
+    # How long a pending write proposal waits for the user's yes/no before it
+    # is dropped (seconds). Tune per deployment — a chattier channel may want
+    # a shorter window so a walked-away user can't confirm a stale proposal.
+    PENDING_TTL_SECONDS: float = 600.0
+
     # Resilience — per-call retry on transient errors (rate limit / 5xx)
     LLM_MAX_RETRIES: int = 2
 
     # Cost control — cumulative token quota per org (0 = unlimited / disabled)
     ORG_TOKEN_QUOTA: int = 0
+
+    # Metering backend — "inprocess" (default) or "postgres".
+    # The in-process store is single-instance; "postgres" talks to the
+    # node-api's /admin/metering/* routes for multi-instance-safe counters.
+    # See metering/usage.py for the protocol + factory.
+    METERING_BACKEND: Literal["inprocess", "postgres"] = "inprocess"
+
+    # Embedding provider — "noop" (default, returns zero vector, no API
+    # key needed) or "google" (real semantic embeddings via Google AI
+    # Studio free tier, requires GOOGLE_AI_API_KEY).
+    EMBEDDING_PROVIDER: Literal["noop", "google"] = "noop"
+    GOOGLE_AI_API_KEY: str = ""
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 

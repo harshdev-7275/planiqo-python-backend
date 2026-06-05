@@ -27,6 +27,35 @@ _HIGH_KEYWORDS = ("asap", "important", "soon", "p1")
 # A bug defaults to high priority unless the text/LLM say otherwise.
 _BUG_DEFAULT_PRIORITY = "high"
 
+# The four priority values the backend accepts.
+_CANONICAL_PRIORITIES = frozenset({"low", "medium", "high", "critical"})
+
+# When the LLM puts a *non-canonical* priority straight into the entities
+# (e.g. it copies the user's "P0" / "Sev1" / "important" verbatim into the
+# priority field rather than into the free text), map it to the canonical
+# value here. Keyword scanning of the message only fires when priority is
+# unset; this table also fixes an already-set-but-non-canonical value, which
+# is the bug behind stress query #32 ("P0 priority" leaking into the preview).
+_PRIORITY_ALIASES = {
+    "p0": "critical", "sev0": "critical", "sev1": "critical",
+    "blocker": "critical", "urgent": "critical",
+    "p1": "high", "sev2": "high", "important": "high",
+    "p2": "medium", "sev3": "medium", "normal": "medium", "moderate": "medium",
+    "p3": "low", "p4": "low", "sev4": "low", "minor": "low", "trivial": "low",
+}
+
+
+def _canonical_priority(value: Any) -> str | None:
+    """Map a raw priority value to one of ``_CANONICAL_PRIORITIES``.
+
+    Returns the canonical string, or ``None`` if the value is not a
+    recognised priority at all (so the caller can leave it untouched rather
+    than guess)."""
+    v = str(value).strip().lower()
+    if v in _CANONICAL_PRIORITIES:
+        return v
+    return _PRIORITY_ALIASES.get(v)
+
 
 def _matches(text: str, keyword: str) -> bool:
     """Whole-word (or whole-phrase) match, case-insensitive, so 'debugging'
@@ -40,6 +69,18 @@ def _is_unset(value: Any) -> bool:
     return value is None or value == ""
 
 
+def canonicalize_priority(value: Any) -> Any:
+    """Return the canonical priority for *value* if it is a recognised alias,
+    else the original value unchanged.
+
+    Used for UPDATE_ISSUE, where running the full keyword ``normalize_entities``
+    is wrong (it would invent a ``type``/``priority`` from the surrounding
+    sentence) but a literal "P0" in the priority field still needs mapping to
+    "critical" before it reaches the backend."""
+    canonical = _canonical_priority(value)
+    return canonical if canonical is not None else value
+
+
 def normalize_entities(text: str | None, entities: dict[str, Any] | None) -> dict[str, Any]:
     """Return a copy of *entities* with ``type`` and ``priority`` filled in
     according to PM conventions, leaving every other key untouched."""
@@ -50,8 +91,16 @@ def normalize_entities(text: str | None, entities: dict[str, Any] | None) -> dic
     if _is_unset(out.get("type")) and _matches(text, "bug"):
         out["type"] = "bug"
 
-    # If priority is already set explicitly, no convention may overwrite it.
-    if not _is_unset(out.get("priority")):
+    # If priority is already set explicitly, no convention may overwrite it —
+    # but DO canonicalize a non-standard literal the LLM may have copied in
+    # ("P0" -> "critical", "important" -> "high"). A value that is already
+    # canonical ("low") is preserved exactly; an unrecognised value is left
+    # untouched rather than guessed at.
+    existing = out.get("priority")
+    if not _is_unset(existing):
+        canonical = _canonical_priority(existing)
+        if canonical is not None:
+            out["priority"] = canonical
         return out
 
     # --- priority keywords: critical beats high; most specific phrase wins ---

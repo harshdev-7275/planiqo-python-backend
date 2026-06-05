@@ -11,6 +11,8 @@ from langchain.tools import BaseTool
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from chains.sanitize import wrap_untrusted
+
 
 class _NoInput(BaseModel):
     pass
@@ -49,7 +51,8 @@ class ListMembersTool(BaseTool):
                 f" ({m.get('email', 'no email')})"
                 for m in members
             ]
-            return "\n".join(lines)
+            # Names/emails are user-authored — wrap as data (item 19).
+            return wrap_untrusted("\n".join(lines))
         except Exception as e:
             logger.error("tool=list_members failed: {}", e)
             return f"Failed to list members: {e}"
@@ -114,7 +117,11 @@ class MemberIssuesTool(BaseTool):
                 f" — {i.get('status', {}).get('name', 'No status')}"
                 for i in theirs
             ]
-            return f"{display} is assigned {len(theirs)} issue(s):\n" + "\n".join(lines)
+            # Titles are user-authored — wrap as data (item 19).
+            return (
+                f"{display} is assigned {len(theirs)} issue(s):\n"
+                + wrap_untrusted("\n".join(lines))
+            )
         except Exception as e:
             logger.error("tool=member_issues failed: {}", e)
             return f"Failed to get member issues: {e}"

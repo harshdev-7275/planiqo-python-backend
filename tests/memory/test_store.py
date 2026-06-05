@@ -78,6 +78,13 @@ def test_default_ttl_is_long_enough_for_normal_conversations() -> None:
     assert DEFAULT_PENDING_TTL_SECONDS >= 60.0
 
 
+def test_default_ttl_is_sourced_from_settings() -> None:
+    """Item 27: the TTL is configurable via settings, not a buried constant."""
+    from config.settings import settings
+
+    assert DEFAULT_PENDING_TTL_SECONDS == settings.PENDING_TTL_SECONDS
+
+
 def test_reset_clears_one_thread_only() -> None:
     store = ConversationStore()
     store.append("t1", HumanMessage(content="hi"))

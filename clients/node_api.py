@@ -14,10 +14,17 @@ class NodeAPIClient:
             timeout=10.0,
         )
 
-    def _bot_headers(self, user_id: str | None) -> dict[str, str]:
+    def _bot_headers(
+        self, user_id: str | None, idempotency_key: str | None = None
+    ) -> dict[str, str]:
+        headers: dict[str, str] = {}
         if user_id:
-            return {"X-Bot-User-Id": user_id}
-        return {}
+            headers["X-Bot-User-Id"] = user_id
+        if idempotency_key:
+            # Node dedupes a create with the same key, so a retried POST after
+            # a dropped response doesn't create a duplicate issue/sprint (item 17).
+            headers["Idempotency-Key"] = idempotency_key
+        return headers
 
     # --- generic HTTP verbs (JSON is an untyped boundary — callers narrow) ---
 
@@ -29,9 +36,15 @@ class NodeAPIClient:
         return response.json()
 
     async def post(
-        self, path: str, body: dict[str, Any] | None = None, user_id: str | None = None
+        self,
+        path: str,
+        body: dict[str, Any] | None = None,
+        user_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> Any:
-        response = await self._client.post(path, json=body or {}, headers=self._bot_headers(user_id))
+        response = await self._client.post(
+            path, json=body or {}, headers=self._bot_headers(user_id, idempotency_key)
+        )
         response.raise_for_status()
         return response.json()
 

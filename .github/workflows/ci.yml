@@ -1,0 +1,42 @@
+name: AI Service CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly — Mondays 06:00 UTC — to run the intent-accuracy gate (item 24).
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  # Fast gate on every push/PR: lint + types + unit tests (no external APIs).
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync
+      - name: Lint
+        run: uv run ruff check .
+      - name: Type-check
+        run: uv run mypy .
+      - name: Unit tests
+        run: uv run pytest tests/ -m "not integration" -q
+
+  # Intent-accuracy regression gate (item 21). Hits the real LLM, so it only
+  # runs on the weekly schedule / manual dispatch and only when the key exists
+  # — it must never block a PR on a rate-limited model.
+  intent-eval:
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync
+      - name: Intent accuracy gate
+        if: ${{ secrets.GROQ_API_KEY != '' }}
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          AI_PROVIDER: groq
+        run: uv run pytest tests/evals -m integration -q

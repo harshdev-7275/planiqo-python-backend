@@ -13,6 +13,7 @@ ReAct agents; this module dispatches to them directly.
 """
 
 import re
+import uuid
 from typing import Any
 
 from langchain_core.callbacks import Callbacks
@@ -23,14 +24,23 @@ import agents.issue_agent as _issue_agent
 import agents.member_agent as _member_agent
 import agents.sprint_agent as _sprint_agent
 import agents.summarize_agent as _summarize_agent
+from agents.preview import (
+    build_preview,
+    effective_title,
+    ground_create_issue_title,
+    ground_sprint_name,
+)
 from agents.state import SupervisorState
 from chains.intent import classify
-from chains.normalizer import normalize_entities
+from chains.normalizer import canonicalize_priority, normalize_entities
+from chains.pre_router import pre_route
+from chains.title_clean import clean_title
+from chains.yes_no import is_affirmation, is_negation
 from clients.neo4j_client import neo4j_client
 from clients.node_api import node_api_client
 from config.settings import settings
 from graph.queries import find_user_by_name
-from memory.store import DEFAULT_PENDING_TTL_SECONDS, conversation_store
+from memory.store import conversation_store
 from metering.callback import UsageCallback
 from metering.usage import RequestTokens, usage_store
 from models.intents import Intent, IntentResult
@@ -38,101 +48,97 @@ from models.intents import Intent, IntentResult
 # Intents that mutate data — proposed and confirmed before they run.
 WRITE_INTENTS = {Intent.CREATE_ISSUE, Intent.UPDATE_ISSUE, Intent.CREATE_SPRINT}
 
+# Below this classifier confidence, a WRITE intent is too uncertain to act on:
+# guessing create-vs-update on an ambiguous message risks creating or changing
+# the wrong thing. We ask the user to clarify instead. Reads are
+# non-destructive and proceed even when uncertain. (plan 4.2)
+MIN_WRITE_CONFIDENCE = 0.6
+
 # Emit a per-org usage milestone at every Nth request so ops can see traffic
 # patterns and per-tenant cost growth in the log stream without scraping the
 # /admin/usage endpoint. ``0`` disables the log.
 USAGE_MILESTONE_EVERY = 100
 
-# Exact-phrase matches. Kept for short replies where word-set matching is too
-# permissive (e.g. "ok" alone vs. "ok to delete production" — the latter is
-# not a confirmation, but every word *is* in _AFFIRM_WORDS).
-_AFFIRMATIONS = {
-    "yes", "y", "yeah", "yep", "yup", "confirm", "confirmed", "ok", "okay", "k",
-    "sure", "do it", "go ahead", "yes please", "please do", "proceed", "sounds good",
-}
-_NEGATIONS = {
-    "no", "n", "nope", "cancel", "stop", "nevermind", "never mind", "abort",
-    "dont", "don't",
-}
-
-# Vocabulary for word-set matching — every word in the reply must come from
-# this set AND at least one word from the core set must be present. This lets
-# "yes please do it" / "yeah go ahead" / "ok sounds good" all match without
-# letting unrelated sentences through.
-_AFFIRM_WORDS: frozenset[str] = frozenset({
-    "yes", "y", "yeah", "yep", "yup", "ok", "okay", "k", "sure", "confirm",
-    "confirmed", "proceed", "please", "do", "it", "go", "ahead", "sounds", "good",
-})
-_AFFIRM_CORE: frozenset[str] = frozenset({
-    "yes", "y", "yeah", "yep", "yup", "ok", "okay", "k", "sure", "confirm",
-    "confirmed", "proceed",
-})
-_NEGATE_WORDS: frozenset[str] = frozenset({
-    "no", "n", "nope", "cancel", "stop", "abort", "never", "mind", "nevermind",
-    "dont", "don't",
-    # Contextual negations — common replies after the bot says "No X matching
-    # 'Y' found". The user means "yeah I see, cancel" without literally
-    # typing "no". "found" is in vocab but NOT in core: it can be a positive
-    # ("I found it"), so a single-token "found" must not match on its own.
-    "not", "found", "doesn't", "doesnt", "exist", "wrong", "missing",
-    "none", "those", "of", "one",
-})
-_NEGATE_CORE: frozenset[str] = frozenset({
-    "no", "n", "nope", "cancel", "stop", "abort", "dont", "don't",
-    # The load-bearing words for contextual negations. "found" is
-    # deliberately NOT here — it can be positive ("I found the bug").
-    "not", "doesn't", "doesnt", "wrong", "none", "missing",
-})
+# Confirm/Cancel button affordances surfaced on an awaiting_confirmation
+# response (plan 4.4, item 18). A Teams adapter renders these as Adaptive Card
+# buttons; the dashboard ignores the field and lets the user type "yes"/"no".
+# The button VALUES ("yes"/"no") are already recognised by _is_affirmation /
+# _is_negation, so a button click and a typed reply travel the same code path —
+# no separate Teams branch, no extra word-matching.
+CONFIRM_ACTIONS = [
+    {"title": "Confirm", "value": "yes"},
+    {"title": "Cancel", "value": "no"},
+]
 
 _UNKNOWN_MESSAGE = (
     "I didn't understand that. Try asking about issues, sprints, or team members."
 )
 
-# Common sentence punctuation that would otherwise survive ``.split()`` and
-# block word-set matching (e.g. "yes," / "no.").
-_PUNCT_RE = re.compile(r"[.!?,;:]")
+# Shown when the AI provider rate-limits us (HTTP 429). A clear, specific ask
+# to retry beats the generic "unexpected error" — the user knows it's transient
+# and that nothing is wrong with their request.
+_RATE_LIMIT_MESSAGE = (
+    "I'm being rate-limited by the AI provider right now. "
+    "Please try again in a moment."
+)
 
+_GENERIC_ERROR_MESSAGE = (
+    "I hit an unexpected error while handling that request. "
+    "Please try again in a moment."
+)
+
+# Shown when a write intent is classified with low confidence — rather than
+# guess and mutate the wrong thing, ask the user to restate.
+_LOW_CONFIDENCE_WRITE_MESSAGE = (
+    "I'm not sure I understood that correctly. Did you want to create a new "
+    "item or update an existing one? Please rephrase with a bit more detail — "
+    "for example \"create a bug: checkout fails on mobile\" or "
+    "\"set issue 5 priority to high\"."
+)
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """True if *exc* (or anything it wraps) is a provider 429 / rate-limit.
+
+    LangChain wraps the provider exception, so we walk the ``__cause__`` /
+    ``__context__`` chain. The reliable signals are a ``status_code == 429``
+    attribute (groq + openai ``RateLimitError`` both expose it) and a class
+    name containing 'ratelimit'; a string check is the last-resort fallback."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if getattr(cur, "status_code", None) == 429:
+            return True
+        if "ratelimit" in type(cur).__name__.lower():
+            return True
+        cur = cur.__cause__ or cur.__context__
+    text = str(exc).lower()
+    return "rate limit" in text or "too many requests" in text
+
+
+def _error_message(exc: BaseException) -> str:
+    """The user-facing message for an exception on the LLM path — specific for
+    a rate limit, generic otherwise."""
+    return _RATE_LIMIT_MESSAGE if _is_rate_limit_error(exc) else _GENERIC_ERROR_MESSAGE
+
+# Shown when a CREATE_ISSUE has no usable title (the LLM extracted none and the
+# user's phrasing has nothing to clean into one). Asking is strictly better than
+# proposing an issue literally titled "(untitled)" — the user can't meaningfully
+# confirm a name they never gave.
+_MISSING_TITLE_MESSAGE = (
+    "What should I title this issue? For example: "
+    "\"create a bug: login button does nothing on mobile\"."
+)
 
 def _thread_id(user_id: str, org_slug: str, project_id: str | None) -> str:
     return f"{user_id}:{org_slug}:{project_id or '-'}"
 
 
-def _normalize(text: str) -> str:
-    """Lowercase, strip surrounding whitespace, replace punctuation with spaces,
-    collapse runs of spaces. Keeps word boundaries clean for matching."""
-    cleaned = _PUNCT_RE.sub(" ", text.strip().lower())
-    return " ".join(cleaned.split())
-
-
-def _is_word_set_reply(normalized: str, vocab: frozenset[str], core: frozenset[str]) -> bool:
-    """True iff the reply is non-empty, every word is in ``vocab``, and at
-    least one core (load-bearing) word is present. Prevents stray confirmations
-    like 'ok' from being triggered by unrelated sentences that happen to
-    contain only affirmation words."""
-    words = normalized.split()
-    if not words:
-        return False
-    if not all(w in vocab for w in words):
-        return False
-    return any(w in core for w in words)
-
-
-def _is_affirmation(text: str) -> bool:
-    norm = _normalize(text)
-    if not norm:
-        return False
-    if norm in _AFFIRMATIONS:  # exact phrase like "do it" / "sounds good"
-        return True
-    return _is_word_set_reply(norm, _AFFIRM_WORDS, _AFFIRM_CORE)
-
-
-def _is_negation(text: str) -> bool:
-    norm = _normalize(text)
-    if not norm:
-        return False
-    if norm in _NEGATIONS:  # exact phrase like "never mind"
-        return True
-    return _is_word_set_reply(norm, _NEGATE_WORDS, _NEGATE_CORE)
+# Yes/no detection lives in chains.yes_no now. Re-exported under the old private
+# names so existing imports/tests (``supervisor._is_affirmation``) keep working.
+_is_affirmation = is_affirmation
+_is_negation = is_negation
 
 
 # --- routing -----------------------------------------------------------------
@@ -155,132 +161,15 @@ def _route_intent(intent_result: IntentResult) -> str:
 
 
 # --- write confirmation preview ----------------------------------------------
-
-
-def _join_clauses(parts: list[str]) -> str:
-    """Join human-readable action clauses with Oxford-comma grammar.
-
-    ``["a"]``         -> "a"
-    ``["a", "b"]``    -> "a and b"
-    ``["a", "b", "c"]`` -> "a, b, and c"
-    """
-    if len(parts) == 1:
-        return parts[0]
-    if len(parts) == 2:
-        return f"{parts[0]} and {parts[1]}"
-    return ", ".join(parts[:-1]) + f", and {parts[-1]}"
-
-
-# Title cleaning for the preview. The LLM often copies the user's full verb
-# phrase ("Create a bug for the login page to Alice") into the title field;
-# the preview should show the issue's name, not the sentence the user typed.
-_LEADING_VERBS: frozenset[str] = frozenset({
-    "create", "add", "open", "file", "log", "make",
-    "raise", "submit", "track",
-})
-_DETERMINERS: frozenset[str] = frozenset({"a", "an", "the"})
-# Trailing prepositional phrases to strip — the assignee / sprint / project
-# meta the LLM copies from the user's full sentence. Word-level only, no
-# regex; we scan from the END so the rightmost preposition wins (avoids
-# eating "for checkout to Bob" when only "to Bob" is meta).
-_TRAILING_PREPOSITIONS: frozenset[str] = frozenset({
-    "for", "to", "in", "on", "at", "with", "by", "from", "of",
-})
-
-# If a trailing strip would leave the title shorter than this, restore the
-# original — the strip ate too much meaningful text.
-_MIN_TITLE_AFTER_STRIP = 8
-
-_MAX_TITLE_LEN = 200
-
-
-def _strip_trailing_prepositional_meta(text: str) -> str:
-    """Drop the last prepositional phrase at the end of ``text`` if it
-    would leave at least _MIN_TITLE_AFTER_STRIP chars. Scans from the end
-    so only the *rightmost* prepositional phrase is considered — the
-    leftmost-preposition regex would over-eat ("for checkout to Bob"
-    would all get stripped when only "to Bob" is meta)."""
-    words = text.split()
-    if len(words) < 2:
-        return text
-    for n in range(1, min(6, len(words))):
-        tail = " ".join(words[-n:])
-        if tail.split()[0].lower() in _TRAILING_PREPOSITIONS:
-            new_text = " ".join(words[:-n])
-            if len(new_text.strip()) >= _MIN_TITLE_AFTER_STRIP:
-                return new_text
-            return text  # strip would leave too little — restore
-    return text
-
-
-def _clean_title(raw: str | None) -> str:
-    """Clean an LLM-extracted issue title.
-
-    Two safe operations:
-      1. Drop a leading imperative verb + optional determiner
-         ("Create a …" → "…").
-      2. Drop the *last* prepositional phrase at the end of the string
-         ("to Alice", "in Sprint 1", "for the team") — only if at least
-         _MIN_TITLE_AFTER_STRIP chars remain after the strip.
-
-    Plus: collapse whitespace, strip trailing punctuation, cap at
-    _MAX_TITLE_LEN. Returns "" for empty/None input (the caller falls back
-    to a sentinel like "(untitled)").
-    """
-    if not raw:
-        return ""
-    text = raw.strip()
-    # 1. Leading verb + optional determiner.
-    parts = text.split(maxsplit=2)
-    if parts and parts[0].lower() in _LEADING_VERBS:
-        rest = parts[1:]
-        if rest and rest[0].lower() in _DETERMINERS:
-            rest = rest[1:]
-        text = " ".join(rest) if rest else ""
-    # 2. Trailing prepositional phrase (scans from end — see helper docstring).
-    text = _strip_trailing_prepositional_meta(text)
-    # 3. Collapse whitespace, strip trailing punctuation, cap length.
-    text = re.sub(r"\s+", " ", text).strip().rstrip(".,;:!?")
-    if len(text) > _MAX_TITLE_LEN:
-        text = text[:_MAX_TITLE_LEN].rstrip()
-    return text
-
-
-def _preview(intent_result: IntentResult) -> str:
-    """A human-readable confirmation prompt built from the extracted entities.
-    All extracted mutations are surfaced so the user is never silently agreeing
-    to a side-effect they didn't read (e.g. an assignee they didn't mention)."""
-    entities = intent_result.entities
-    if intent_result.intent == Intent.CREATE_ISSUE:
-        title = _clean_title(entities.get("title") or entities.get("name")) or "(untitled)"
-        # The LLM may return `null` for fields it can't fill — fall through
-        # to defaults so the user never sees the literal Python ``None``
-        # in their proposal.
-        issue_type = entities.get("type") or "task"
-        priority = entities.get("priority") or "medium"
-        parts = [f"create a {issue_type} titled '{title}' with {priority} priority"]
-        # The LLM may emit either 'assignee' or 'assignee_id' depending on the
-        # prompt / model; accept both.
-        assignee = entities.get("assignee") or entities.get("assignee_id")
-        if assignee:
-            parts.append(f"assign it to {assignee}")
-        sprint = entities.get("sprint") or entities.get("sprint_id")
-        if sprint:
-            parts.append(f"put it in sprint {sprint}")
-        return f"I'll {_join_clauses(parts)}. Reply 'yes' to confirm or 'no' to cancel."
-    if intent_result.intent == Intent.UPDATE_ISSUE:
-        target = entities.get("issue") or entities.get("number") or "that issue"
-        parts = [f"update {target}"]
-        for key, label in (("status", "status"), ("priority", "priority"),
-                           ("assignee", "assignee"), ("assignee_id", "assignee"),
-                           ("title", "title"), ("sprint", "sprint"), ("sprint_id", "sprint")):
-            if key in entities and key not in ("issue", "number"):
-                parts.append(f"set {label} to {entities[key]}")
-        return f"I'll {_join_clauses(parts)}. Reply 'yes' to confirm or 'no' to cancel."
-    if intent_result.intent == Intent.CREATE_SPRINT:
-        name = entities.get("name") or entities.get("title") or "a new sprint"
-        return f"I'll create sprint '{name}'. Reply 'yes' to confirm or 'no' to cancel."
-    return "Please reply 'yes' to confirm or 'no' to cancel."
+#
+# Preview construction + title/sprint grounding moved to agents.preview; title
+# cleaning to chains.title_clean. Re-exported under the old private names so
+# ``run`` (below) and any external imports keep working unchanged.
+_clean_title = clean_title
+_ground_create_issue_title = ground_create_issue_title
+_ground_sprint_name = ground_sprint_name
+_effective_title = effective_title
+_preview = build_preview
 
 
 # --- pre-flight entity validation -------------------------------------------
@@ -290,6 +179,13 @@ def _preview(intent_result: IntentResult) -> str:
 # Without this, the user confirms "yes" only to learn the assignee / sprint
 # didn't exist — a frustrating two-step failure. With this, the error lands
 # immediately and lists the valid options.
+#
+# As a side effect, validation also produces a ``resolved`` map of
+# name-keys → ID-keys (e.g. ``assignee_id``/``sprint_id``). The supervisor
+# persists this on the pending proposal so the write executor can post the
+# *exact* validated IDs on confirmation — no name re-resolution at execute
+# time, no preview/execute drift. This is the single-pass design: one
+# ``find_user_by_name`` call serves both the error check and the ID stash.
 #
 # Resilience rule: if the upstream (Neo4j or Node) is unreachable, we LOG
 # and SKIP validation rather than blocking the user on flaky infra. The
@@ -330,7 +226,16 @@ async def _check_assignee_name(
         return None
     if matches:
         return None  # at least one match
-    # No match — list actual members so the user can pick.
+    return await _build_assignee_error_message(org_slug, project_id, name)
+
+
+async def _build_assignee_error_message(
+    org_slug: str, project_id: str, name: str
+) -> str | None:
+    """Build the user-facing 'no team member named X' error and list real
+    members so the user can pick. Extracted from ``_check_assignee_name`` so
+    ``_validate_intent`` can do one ``find_user_by_name`` call and then ask
+    for the error message separately when the name fails to resolve."""
     try:
         members = await node_api_client.get_project_members(org_slug, project_id)
     except Exception as e:
@@ -339,8 +244,12 @@ async def _check_assignee_name(
     msg = f"No team member named '{name}' found in this project."
     if members:
         names = [_coerce_member_name(m) for m in members[:_MAX_LISTED]]
-        msg += f" Team members: {', '.join(names)}."
-    msg += " Please pick one of them or use the exact name."
+        # Put the valid options on their own line so the user sees the choices
+        # at a glance rather than buried mid-sentence (item 10).
+        msg += f"\nAvailable members: {', '.join(names)}."
+        msg += "\nReply with one of those names (or the exact name)."
+    else:
+        msg += " There are no members in this project to assign to yet."
     return msg
 
 
@@ -362,10 +271,21 @@ async def _check_sprint_name(
     ]
     if matches:
         return None
+    return _build_sprint_error_message(name, sprints)
+
+
+def _build_sprint_error_message(
+    name: str, sprints: list[dict[str, Any]]
+) -> str | None:
+    """Build the user-facing 'no sprint matching X' error with the list of
+    real sprints. Extracted from ``_check_sprint_name`` for the same reason
+    ``_build_assignee_error_message`` exists — single-pass validation."""
     names = [_coerce_sprint_name(s) for s in sprints[:_MAX_LISTED]]
     msg = f"No sprint matching '{name}' found in this project."
     if names:
-        msg += f" Available sprints: {', '.join(names)}."
+        # Options on their own line — easier to scan than an inline list (item 10).
+        msg += f"\nAvailable sprints: {', '.join(names)}."
+        msg += "\nReply with one of those names."
     return msg
 
 
@@ -447,48 +367,96 @@ async def _validate_intent(
     intent_result: IntentResult,
     org_slug: str,
     project_id: str | None,
-) -> str | None:
-    """Pre-flight validation for write intents. Returns None if all referenced
-    entities resolve, else a user-facing error message describing what's
-    missing and listing valid options."""
+) -> tuple[str | None, dict[str, Any]]:
+    """Pre-flight validation for write intents + side-effect ID resolution.
+
+    Returns ``(error, resolved)``:
+      * ``error`` — ``None`` if every referenced entity resolves; otherwise a
+        user-facing message (e.g. "no team member named 'X'") that lists the
+        valid options.
+      * ``resolved`` — a side-car dict of name-keys → ID-keys for the
+        entities the user mentioned by NAME (e.g. ``assignee_id``, ``sprint_id``).
+        The supervisor persists this on the pending proposal so the write
+        executor can POST the *exact* validated IDs on confirmation. One
+        ``find_user_by_name`` call serves both the error check and the ID
+        stash — no duplicate lookups on the request path.
+    """
     if not project_id:
-        return None  # no project context to validate against
+        return None, {}
     intent = intent_result.intent
     if intent not in WRITE_INTENTS:
-        return None
+        return None, {}
     entities = intent_result.entities
     errors: list[str] = []
+    resolved: dict[str, Any] = {}
 
-    if intent == Intent.CREATE_ISSUE:
+    if intent == Intent.CREATE_ISSUE or intent == Intent.UPDATE_ISSUE:
+        if intent == Intent.UPDATE_ISSUE:
+            issue_num = entities.get("issue") or entities.get("number")
+            err = await _check_issue_number(org_slug, project_id, issue_num)
+            if err:
+                errors.append(err)
+
+        # --- Assignee: resolve via Neo4j, fall back to user-facing error. ---
         assignee = entities.get("assignee") or entities.get("assignee_id")
         if assignee:
-            err = await _check_assignee_name(org_slug, project_id, str(assignee))
-            if err:
-                errors.append(err)
+            if _looks_like_id(str(assignee)):
+                resolved["assignee_id"] = str(assignee)
+            else:
+                rid = await _resolve_assignee_via_graph(project_id, str(assignee))
+                if rid:
+                    resolved["assignee_id"] = rid
+                else:
+                    err = await _check_assignee_name(org_slug, project_id, str(assignee))
+                    if err:
+                        errors.append(err)
+
+        # --- Sprint: resolve via Node, fall back to user-facing error. ---
         sprint = entities.get("sprint") or entities.get("sprint_id")
         if sprint:
-            err = await _check_sprint_name(org_slug, project_id, str(sprint))
-            if err:
-                errors.append(err)
+            if _looks_like_id(str(sprint)):
+                resolved["sprint_id"] = str(sprint)
+            else:
+                rid = await _resolve_sprint_via_node(org_slug, project_id, str(sprint))
+                if rid:
+                    resolved["sprint_id"] = rid
+                else:
+                    err = await _check_sprint_name(org_slug, project_id, str(sprint))
+                    if err:
+                        errors.append(err)
 
-    elif intent == Intent.UPDATE_ISSUE:
-        # Resolve issue number + any name→ID change first
-        issue_num = entities.get("issue") or entities.get("number")
-        err = await _check_issue_number(org_slug, project_id, issue_num)
-        if err:
-            errors.append(err)
-        assignee = entities.get("assignee") or entities.get("assignee_id")
-        if assignee:
-            err = await _check_assignee_name(org_slug, project_id, str(assignee))
-            if err:
-                errors.append(err)
-        sprint = entities.get("sprint") or entities.get("sprint_id")
-        if sprint:
-            err = await _check_sprint_name(org_slug, project_id, str(sprint))
-            if err:
-                errors.append(err)
+    return ("\n\n".join(errors) if errors else None), resolved
 
-    return "\n\n".join(errors) if errors else None
+
+# --- name → ID resolution helpers used by _validate_intent -----------------
+
+
+async def _resolve_assignee_via_graph(project_id: str, name: str) -> str | None:
+    """Return the project member's UUID for a name, or None if no match OR
+    Neo4j is unreachable. The validation caller handles the error message in
+    the failure case so the user still sees the list of valid members."""
+    try:
+        matches = await find_user_by_name(neo4j_client, project_id, name)
+    except Exception as e:
+        logger.warning("validation: Neo4j unreachable, skipping assignee resolve: {}", e)
+        return None
+    return matches[0]["id"] if matches else None
+
+
+async def _resolve_sprint_via_node(
+    org_slug: str, project_id: str, name: str
+) -> str | None:
+    """Return the sprint's UUID for a name, or None if no match OR Node is
+    unreachable."""
+    try:
+        sprints = await node_api_client.get_sprints(org_slug, project_id)
+    except Exception as e:
+        logger.warning("validation: Node unreachable, skipping sprint resolve: {}", e)
+        return None
+    matches = [
+        s for s in sprints if _match_sprint_name(name, _coerce_sprint_name(s))
+    ]
+    return matches[0]["id"] if matches else None
 
 
 # --- execution ---------------------------------------------------------------
@@ -501,9 +469,56 @@ async def _execute(
     org_slug: str,
     project_id: str | None,
     callbacks: Callbacks = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
-    """Dispatch a classified intent to its agent and return a result dict that
-    always contains a 'message'."""
+    """Dispatch a classified intent and return a result dict that always
+    contains a 'message'.
+
+    Sprint 1.1: CONFIRMED writes go to the deterministic
+    ``write_executor`` (no LLM, no re-derivation). This is the architectural
+    fix for the preview/execute drift — the validated entities (with
+    pre-resolved IDs merged in) are posted exactly as the user saw them in
+    the preview. The ReAct agents remain for genuinely open-ended reads.
+    """
+    intent = intent_result.intent
+
+    # Confirmed-write fast path: skip the ReAct agent, call the executor.
+    if intent in WRITE_INTENTS:
+        from agents import write_executor  # local import to avoid a cycle
+
+        entities = intent_result.entities
+        if intent == Intent.CREATE_ISSUE:
+            out = await write_executor.execute_create_issue(
+                entities=entities,
+                api=node_api_client,
+                org_slug=org_slug,
+                project_id=project_id or "",
+                user_id=user_id,
+                idempotency_key=idempotency_key,
+            )
+        elif intent == Intent.UPDATE_ISSUE:
+            out = await write_executor.execute_update_issue(
+                entities=entities,
+                api=node_api_client,
+                org_slug=org_slug,
+                project_id=project_id or "",
+                user_id=user_id,
+            )
+        else:  # CREATE_SPRINT
+            out = await write_executor.execute_create_sprint(
+                entities=entities,
+                api=node_api_client,
+                org_slug=org_slug,
+                project_id=project_id or "",
+                user_id=user_id,
+                idempotency_key=idempotency_key,
+            )
+        # Executor returns the agent-shape ``{"result": {"message": str}}``;
+        # unwrap to the inner ``{"message": str}`` the supervisor expects.
+        unwrapped: dict[str, Any] = out.get("result", out)
+        return unwrapped
+
+    # Reads and any future intents: the ReAct agent chooses the tool.
     state: SupervisorState = {
         "messages": messages,
         "user_id": user_id,
@@ -586,20 +601,45 @@ async def run(
     # 1) Resolve an outstanding confirmation before anything else. ``get_pending``
     # transparently drops a stale proposal so an absent user does not poison
     # the next unrelated message.
-    pending = conversation_store.get_pending(thread, ttl_seconds=DEFAULT_PENDING_TTL_SECONDS)
+    pending = conversation_store.get_pending(thread, ttl_seconds=settings.PENDING_TTL_SECONDS)
     if pending is not None:
         if _is_affirmation(message):
             conversation_store.clear_pending(thread)
+            # Merge the user-facing entities with the IDs the validation gate
+            # already resolved (assignee_id, sprint_id). The write executor
+            # reads the merged dict — it NEVER re-resolves names, so preview
+            # == execution by construction.
+            merged = {**pending.get("entities", {}), **pending.get("resolved", {})}
             intent_result = IntentResult(
                 intent=Intent(pending["intent"]),
                 confidence=1.0,
-                entities=pending.get("entities", {}),
+                entities=merged,
             )
-            # Execute the ORIGINAL request, not the bare "yes".
-            exec_messages = history + [HumanMessage(content=pending["message"])]
-            result = await _execute(
-                intent_result, exec_messages, user_id, org_slug, project_id, callbacks=callbacks
-            )
+            # Sprint 3.x: defense in depth — even though the executor and
+            # the ReAct agents catch their own errors, an unexpected crash
+            # (e.g. an LLM that throws instead of returning a string)
+            # must not 500 the /chat endpoint. The user sees a friendly
+            # message instead.
+            try:
+                result = await _execute(
+                    intent_result, [], user_id, org_slug, project_id,
+                    callbacks=callbacks,
+                    # Reuse the key minted when the proposal was created, so a
+                    # retried confirmation POSTs with the SAME Idempotency-Key
+                    # and Node dedupes the create (item 17).
+                    idempotency_key=pending.get("idempotency_key"),
+                )
+            except Exception as e:
+                logger.error(
+                    "supervisor confirmed intent crashed: {}", e, exc_info=True,
+                )
+                result = {
+                    "message": (
+                        "I couldn't complete that action — the system hit an "
+                        "unexpected error. The change was NOT made. Please try "
+                        "again or rephrase."
+                    )
+                }
             conversation_store.append(thread, user_msg, AIMessage(content=result["message"]))
             logger.info("supervisor confirmed intent={}", pending["intent"])
             return {
@@ -627,12 +667,60 @@ async def run(
         conversation_store.clear_pending(thread)
         logger.info("supervisor dropped stale pending: reply was neither yes nor no")
 
-    # 2) Classify the new message.
-    intent_result = await classify(message, callbacks=callbacks)
-    logger.info(
-        "supervisor intent={} confidence={:.2f}",
-        intent_result.intent.value, intent_result.confidence,
-    )
+    # 2) Determine intent. Try the cheap deterministic pre-router first
+    # (item 12) — an unmistakable message ("show me all issues", a bare
+    # greeting) skips the paid LLM classify entirely. The pre-router never
+    # returns a WRITE (those need full entity extraction), so the write paths
+    # below are unaffected.
+    pre_routed = pre_route(message)
+    if pre_routed is not None:
+        intent_result = pre_routed
+        logger.info(
+            "supervisor pre-routed intent={} (no LLM call)", intent_result.intent.value
+        )
+    else:
+        # classify() never raises on a bad/parse response (it returns UNKNOWN),
+        # but the LLM CALL itself can still raise — e.g. all model tiers are
+        # rate-limited. Wrap it so a 429 becomes a clear "try again", not a 500.
+        try:
+            intent_result = await classify(message, callbacks=callbacks)
+        except Exception as e:
+            logger.error("supervisor classify crashed: {}", e, exc_info=True)
+            msg = _error_message(e)
+            conversation_store.append(thread, user_msg, AIMessage(content=msg))
+            return {
+                "intent": None,
+                "result": {"message": msg},
+                "status": "error",
+                "error": None,
+                "tokens_used": request_tokens.total,
+            }
+        logger.info(
+            "supervisor intent={} confidence={:.2f}",
+            intent_result.intent.value, intent_result.confidence,
+        )
+
+    # 2-pre) Low-confidence WRITE guard (plan 4.2): confirm the intent itself
+    # before we propose a concrete mutation. A 0.4-confidence read of an
+    # ambiguous message must not silently become a create/update proposal.
+    if (
+        intent_result.intent in WRITE_INTENTS
+        and intent_result.confidence < MIN_WRITE_CONFIDENCE
+    ):
+        conversation_store.append(
+            thread, user_msg, AIMessage(content=_LOW_CONFIDENCE_WRITE_MESSAGE)
+        )
+        logger.info(
+            "supervisor low-confidence write intent={} conf={:.2f} — asking to clarify",
+            intent_result.intent.value, intent_result.confidence,
+        )
+        return {
+            "intent": intent_result.intent.value,
+            "result": {"message": _LOW_CONFIDENCE_WRITE_MESSAGE},
+            "status": "needs_input",
+            "error": None,
+            "tokens_used": request_tokens.total,
+        }
 
     # 2a) Apply PM-domain conventions (a bug is high priority, "urgent" means
     # critical, …) as a deterministic post-pass over the LLM's extraction.
@@ -640,15 +728,50 @@ async def run(
     # are what the user confirms AND what is executed — no preview/execute drift.
     if intent_result.intent == Intent.CREATE_ISSUE:
         intent_result.entities = normalize_entities(message, intent_result.entities)
+        _ground_create_issue_title(intent_result.entities, message)
+    elif intent_result.intent == Intent.CREATE_SPRINT:
+        _ground_sprint_name(intent_result.entities, message)
+    elif intent_result.intent == Intent.UPDATE_ISSUE:
+        # An update must NOT run the keyword normalizer (it would invent a
+        # type/priority from the sentence), but a literal "P0" the LLM copied
+        # into the priority field still needs mapping to "critical".
+        pr = intent_result.entities.get("priority")
+        if pr:
+            intent_result.entities["priority"] = canonicalize_priority(pr)
+
+    # 2a-bis) A create with no usable title can't be meaningfully confirmed —
+    # ask for one instead of proposing an issue titled "(untitled)". This runs
+    # before validation so the user is asked for the missing essential first,
+    # not told about an unresolved assignee on an unnamed issue.
+    if (
+        intent_result.intent == Intent.CREATE_ISSUE
+        and not _effective_title(intent_result.entities)
+    ):
+        conversation_store.append(
+            thread, user_msg, AIMessage(content=_MISSING_TITLE_MESSAGE)
+        )
+        logger.info("supervisor create_issue missing title — asking user")
+        return {
+            "intent": intent_result.intent.value,
+            "result": {"message": _MISSING_TITLE_MESSAGE},
+            "status": "needs_input",
+            "error": None,
+            "tokens_used": request_tokens.total,
+        }
 
     # 2b) Pre-flight validation: for write intents, verify every entity the
-    # user mentioned by NAME actually resolves. Failures short-circuit BEFORE
-    # the proposal so the user gets a "no team member named X" message
-    # instead of a "yes"-then-error flow. Upstream failures (Neo4j/Node
-    # down) are swallowed and the proposal proceeds — the post-confirm
-    # error path still surfaces the issue if needed.
+    # user mentioned by NAME actually resolves AND stash the resolved IDs on
+    # the proposal so the write executor can post the *exact* validated IDs
+    # on confirmation (no re-resolution, no preview/execute drift). Failures
+    # short-circuit BEFORE the proposal so the user gets a "no team member
+    # named X" message instead of a "yes"-then-error flow. Upstream failures
+    # (Neo4j/Node down) are swallowed and the proposal proceeds — the
+    # post-confirm error path still surfaces the issue if needed.
+    resolved: dict[str, Any] = {}
     if intent_result.intent in WRITE_INTENTS:
-        validation_error = await _validate_intent(intent_result, org_slug, project_id)
+        validation_error, resolved = await _validate_intent(
+            intent_result, org_slug, project_id
+        )
         if validation_error:
             conversation_store.append(
                 thread, user_msg, AIMessage(content=validation_error)
@@ -672,6 +795,10 @@ async def run(
             "intent": intent_result.intent.value,
             "message": message,
             "entities": intent_result.entities,
+            "resolved": resolved,
+            # Minted once per proposal; reused if the confirmation is retried
+            # so the create is idempotent at the Node layer (item 17).
+            "idempotency_key": uuid.uuid4().hex,
         })
         conversation_store.append(thread, user_msg, AIMessage(content=preview))
         logger.info("supervisor proposed intent={} (awaiting confirmation)", intent_result.intent.value)
@@ -679,14 +806,28 @@ async def run(
             "intent": intent_result.intent.value,
             "result": {"message": preview},
             "status": "awaiting_confirmation",
+            # Button affordances for an Adaptive Card (item 18). Clicking sends
+            # the value ("yes"/"no") back as the next message — same path as a
+            # typed reply. The dashboard ignores this field.
+            "actions": CONFIRM_ACTIONS,
             "error": None,
             "tokens_used": request_tokens.total,
         }
 
     # 4) Reads and unknowns run immediately, with history for context.
-    result = await _execute(
-        intent_result, history + [user_msg], user_id, org_slug, project_id, callbacks=callbacks
-    )
+    # Sprint 3.x: defense in depth — if the LLM rate-limits, the ReAct
+    # agent's LLM step can raise, or the tool's HTTP call can bubble up
+    # past its own try/except. Either way, the user must NOT see a 500.
+    try:
+        result = await _execute(
+            intent_result, history + [user_msg], user_id, org_slug, project_id, callbacks=callbacks
+        )
+    except Exception as e:
+        logger.error(
+            "supervisor read dispatch crashed for intent={}: {}",
+            intent_result.intent.value, e, exc_info=True,
+        )
+        result = {"message": _error_message(e)}
     conversation_store.append(thread, user_msg, AIMessage(content=result["message"]))
     return {
         "intent": intent_result.intent.value,

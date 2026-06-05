@@ -75,7 +75,9 @@ async def test_supervisor_classify_invokes_usage_callback() -> None:
         patch("agents.sprint_agent.run", new=AsyncMock()),
     ):
         from agents.supervisor import run
-        result = await run(message="show me issues", **BASE)
+        # The message must reach the LLM classify (not the pre-router), so it
+        # is phrased to avoid the deterministic pre-route patterns.
+        result = await run(message="what should I focus on today", **BASE)
 
     # 1) Supervisor reported tokens in the response — proves the per-request
     #    accumulator was attached to the callback AND read at the end.

@@ -4,7 +4,30 @@ from langchain.tools import BaseTool
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from graph.queries import find_similar_issues, find_user_by_name, suggest_assignee
+from chains.sanitize import wrap_untrusted
+from clients.embeddings import embedding_client as _default_embedding_client
+from graph.queries import (
+    find_similar_issues,
+    find_user_by_name,
+    hybrid_similar_issues,
+    suggest_assignee,
+)
+from graph.sync import upsert_issue
+
+
+async def _safe_embed(client: Any, text: str) -> list[float] | None:
+    """Embed ``text`` for the vector index, returning ``None`` on any failure.
+
+    A missing embedding is not fatal: ``upsert_issue`` simply skips the
+    vector field and ``hybrid_similar_issues`` falls back to its word-overlap
+    pre-filter. Per AIService.md, an embedding-provider outage must degrade
+    the smart features, never break the user-facing write."""
+    try:
+        vector: list[float] = await client.embed(text)
+        return vector
+    except Exception as e:
+        logger.warning("embedding failed, proceeding without vector: {}", e)
+        return None
 
 
 class _NoInput(BaseModel):
@@ -58,7 +81,9 @@ class GetIssuesTool(BaseTool):
                 for i in issues
             ]
             logger.info("tool=get_issues returned {} issues", len(issues))
-            return "\n".join(lines)
+            # Issue titles are user-authored — wrap so the agent treats them as
+            # data, not instructions (item 19).
+            return wrap_untrusted("\n".join(lines))
         except Exception as e:
             logger.error("tool=get_issues failed: {}", e)
             return f"Failed to get issues: {e}"
@@ -85,6 +110,7 @@ class CreateIssueTool(BaseTool):
     project_id: str
     user_id: str | None = None
     neo4j_client: Any | None = None
+    embedding_client: Any | None = None
 
     async def _arun(
         self,
@@ -120,6 +146,36 @@ class CreateIssueTool(BaseTool):
             )
             logger.info("tool=create_issue created #{}", result.get("number"))
             response = f"Created #{result['number']}: {result['title']}"
+
+            # Incremental Neo4j sync (Sprint 2.1): the issue was just
+            # created in Postgres — mirror it to the graph so smart
+            # features (find_similar_issues, suggest_assignee) see it
+            # immediately, not on the next nightly full_sync. Failures
+            # are LOGGED and swallowed: a graph outage must not break the
+            # user-facing response.
+            #
+            # The Node POST response typically contains only number/title
+            # — the validated type/priority/assigneeId we already have on
+            # `body`, so we merge them into the upsert payload.
+            if self.neo4j_client:
+                # Compute the embedding so the vector index (Sprint 2.2) has
+                # data to rank on — without this the index is empty and
+                # hybrid_similar_issues silently falls back to word-overlap
+                # for every query. Embedding failures degrade to no-vector.
+                embedding = await _safe_embed(
+                    self.embedding_client or _default_embedding_client, title
+                )
+                try:
+                    await upsert_issue(
+                        self.neo4j_client, {**body, **result}, embedding=embedding
+                    )
+                except Exception as e:
+                    logger.error(
+                        "tool=create_issue neo4j upsert failed (issue was "
+                        "still created in Postgres; smart features will "
+                        "see it on the next full_sync): {}",
+                        e, exc_info=True,
+                    )
 
             if not self.neo4j_client:
                 logger.debug("tool=create_issue suggestion skipped: no neo4j_client injected")
@@ -219,15 +275,32 @@ class FindSimilarIssuesTool(BaseTool):
     neo4j_client: Any
     org_slug: str
     project_id: str
+    embedding_client: Any | None = None
 
     async def _arun(self, title: str) -> str:
         logger.info("tool=find_similar_issues title='{}'", title)
         try:
-            similar = await find_similar_issues(self.neo4j_client, self.project_id, title)
+            # Sprint 2.2: prefer the hybrid (word-overlap pre-filter + vector
+            # kNN rerank) path so "login fails" matches "can't sign in". If the
+            # embedding can't be computed (provider outage), fall back to the
+            # pure word-overlap query — hybrid itself also degrades on a
+            # vector-index error.
+            embedding = await _safe_embed(
+                self.embedding_client or _default_embedding_client, title
+            )
+            if embedding is not None:
+                similar = await hybrid_similar_issues(
+                    self.neo4j_client, self.project_id, title, embedding
+                )
+            else:
+                similar = await find_similar_issues(
+                    self.neo4j_client, self.project_id, title
+                )
             if not similar:
                 return "No similar issues found."
             lines = [f"#{s['number']}: {s['title']}" for s in similar]
-            return "Similar issues found:\n" + "\n".join(lines)
+            # Titles are user-authored — wrap as data (item 19).
+            return "Similar issues found:\n" + wrap_untrusted("\n".join(lines))
         except Exception as e:
             logger.error("tool=find_similar_issues failed: {}", e)
             return f"Failed to find similar issues: {e}"
@@ -309,6 +382,8 @@ class UpdateIssueTool(BaseTool):
     org_slug: str
     project_id: str
     user_id: str | None = None
+    neo4j_client: Any | None = None
+    embedding_client: Any | None = None
 
     async def _arun(
         self,
@@ -338,6 +413,32 @@ class UpdateIssueTool(BaseTool):
                 user_id=self.user_id,
             )
             logger.info("tool=update_issue updated #{} fields={}", issue_number, list(body))
+            # Incremental Neo4j sync (Sprint 2.1): mirror the updated
+            # issue to the graph so smart features see the new
+            # priority/title/assignee immediately. Failures are
+            # LOGGED and swallowed — a graph outage must not break the
+            # user-facing response.
+            #
+            # Merge the pre-update row with the patch body so the upsert
+            # reflects the new state (Node's PATCH response is often just
+            # the touched fields, not the whole row).
+            if self.neo4j_client:
+                # Re-embed on the effective (possibly new) title so the vector
+                # index tracks the current text. Failures degrade to no-vector.
+                merged = {**match, **body}
+                embedding = await _safe_embed(
+                    self.embedding_client or _default_embedding_client,
+                    str(merged.get("title") or ""),
+                )
+                try:
+                    await upsert_issue(self.neo4j_client, merged, embedding=embedding)
+                except Exception as e:
+                    logger.error(
+                        "tool=update_issue neo4j upsert failed (issue was "
+                        "still updated in Postgres; smart features will "
+                        "see it on the next full_sync): {}",
+                        e, exc_info=True,
+                    )
             return f"Updated #{issue_number}."
         except Exception as e:
             logger.error("tool=update_issue failed: {}", e)
