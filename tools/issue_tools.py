@@ -70,16 +70,29 @@ class GetIssuesTool(BaseTool):
     org_slug: str
     project_id: str
 
+    @staticmethod
+    def _format_issue_line(i: dict[str, Any]) -> str:
+        """One issue → '#N [priority] title — Status · Assignee'.
+
+        Status and assignee come from the bot list's resolved objects
+        (``status``/``assignee``); both degrade gracefully when absent so the
+        agent always gets a usable line. Showing the assignee is what lets the
+        agent answer "who is assigned to what" — without it the agent truthfully
+        but unhelpfully reports it has no assignee data."""
+        status = i.get("status") or {}
+        status_name = status.get("name") or "No status"
+        assignee = i.get("assignee")
+        who = assignee.get("name") if isinstance(assignee, dict) else None
+        who = who or "Unassigned"
+        return f"#{i['number']} [{i['priority']}] {i['title']} — {status_name} · {who}"
+
     async def _arun(self) -> str:
         logger.info("tool=get_issues org={} project={}", self.org_slug, self.project_id)
         try:
             issues: list[dict[str, Any]] = await self.api.get_issues(self.org_slug, self.project_id)
             if not issues:
                 return "No issues found."
-            lines = [
-                f"#{i['number']} [{i['priority']}] {i['title']} — {i.get('status', {}).get('name', 'No status')}"
-                for i in issues
-            ]
+            lines = [self._format_issue_line(i) for i in issues]
             logger.info("tool=get_issues returned {} issues", len(issues))
             # Issue titles are user-authored — wrap so the agent treats them as
             # data, not instructions (item 19).

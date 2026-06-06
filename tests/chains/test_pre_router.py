@@ -234,6 +234,27 @@ async def test_think_tags_are_stripped() -> None:
     assert result.intent == Intent.QUERY_ISSUES
 
 
+async def test_pre_route_parses_response_without_entities() -> None:
+    """The pre-router prompt asks for ONLY intent + confidence — it does no
+    entity extraction. The real LLM therefore omits ``entities``, so the parse
+    must still succeed (entities defaults to {}).
+
+    Regression: when ``IntentResult.entities`` was required, every real
+    pre-router response failed validation ("entities Field required") and
+    pre_route silently returned None, deferring to the heavy classify chain on
+    EVERY message — and mis-routing reads the pre-router had already nailed
+    (e.g. "who is assigned to what" → QUERY_ISSUES got re-classified as
+    TEAMS_CONTEXT → the unbuilt teams_agent). The mocked tests missed it
+    because they serialized a full IntentResult with entities={}.
+    """
+    raw = '{"intent": "QUERY_ISSUES", "confidence": 0.85}'  # no entities key
+    mock_llm = RunnableLambda(lambda _x: AIMessage(content=raw))
+    result = await pre_route("who is assigned to what", llm=mock_llm)
+    assert result is not None
+    assert result.intent == Intent.QUERY_ISSUES
+    assert result.entities == {}
+
+
 async def test_markdown_code_fences_are_stripped() -> None:
     """A common model failure mode is wrapping JSON in ```json fences."""
     wrapped = (

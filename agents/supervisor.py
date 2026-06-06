@@ -34,6 +34,7 @@ from agents.preview import (
     ground_sprint_name,
 )
 from agents.state import SupervisorState
+from chains.followup_resolver import resolve_followup
 from chains.insight import generate_insight
 from chains.intent import classify
 from chains.normalizer import canonicalize_priority, normalize_entities
@@ -142,6 +143,14 @@ _MISSING_TITLE_MESSAGE = (
 
 def _thread_id(user_id: str, org_slug: str, project_id: str | None) -> str:
     return f"{user_id}:{org_slug}:{project_id or '-'}"
+
+
+def _looks_like_question(text: str) -> bool:
+    """True if a reply ends by asking the user something — a deterministic
+    signal that the next turn is a follow-up to be resolved in context, not a
+    fresh request. Minimal heuristic (trailing '?'); the structured-choices
+    version replaces this with an explicit agent signal."""
+    return text.rstrip().endswith("?")
 
 
 # Yes/no detection lives in chains.yes_no now. Re-exported under the old private
@@ -551,8 +560,15 @@ async def _execute(
         out = await _summarize_agent.run(state, callbacks=callbacks)
     elif target == "handle_unknown":
         return {"message": _UNKNOWN_MESSAGE}
-    else:  # teams_agent — not built yet
-        return {"message": f"{target} not yet implemented"}
+    else:
+        # An unimplemented target (e.g. teams_agent) must never surface its
+        # internal name to the user. Log it for us; give the user the same
+        # friendly clarification UNKNOWN gets.
+        logger.warning(
+            "supervisor: unimplemented target '{}' for intent={} — falling back to UNKNOWN reply",
+            target, intent.value,
+        )
+        return {"message": _UNKNOWN_MESSAGE}
 
     result = out.get("result")
     return result if result else {"message": "No response."}
@@ -728,7 +744,40 @@ async def run(
     # the next unrelated message.
     pending = conversation_store.get_pending(thread, ttl_seconds=settings.PENDING_TTL_SECONDS)
     if pending is not None:
-        if _is_affirmation(message):
+        if pending.get("kind") == "clarification":
+            # A prior READ turn asked the user something. Resolve THIS reply in
+            # the context of that question instead of classifying it cold — the
+            # cold classify is what turned "yes" into UNKNOWN ("I didn't
+            # understand"). We rewrite the reply into a standalone request and
+            # fall through to the normal pipeline below. One-shot: the pending is
+            # consumed whether or not the rewrite changes anything.
+            conversation_store.clear_pending(thread)
+            if _is_negation(message):
+                msg = "Okay — what would you like to do instead?"
+                conversation_store.append(thread, user_msg, AIMessage(content=msg))
+                logger.info("supervisor clarification declined")
+                return {
+                    "intent": None,
+                    "result": {"message": msg},
+                    "status": "cancelled",
+                    "error": None,
+                    "tokens_used": request_tokens.total,
+                }
+            resolved_reply = await resolve_followup(
+                question=str(pending.get("question", "")),
+                reply=message,
+                callbacks=callbacks,
+            )
+            if resolved_reply.strip() and resolved_reply.strip() != message.strip():
+                logger.info(
+                    "supervisor resolved clarification '{}' -> '{}'",
+                    message, resolved_reply,
+                )
+                message = resolved_reply
+                user_msg = HumanMessage(content=message)
+            # Fall through to the normal classify → dispatch pipeline below.
+
+        elif _is_affirmation(message):
             conversation_store.clear_pending(thread)
             # Merge the user-facing entities with the IDs the validation gate
             # already resolved (assignee_id, sprint_id). The write executor
@@ -775,7 +824,7 @@ async def run(
                 "tokens_used": request_tokens.total,
             }
 
-        if _is_negation(message):
+        elif _is_negation(message):
             conversation_store.clear_pending(thread)
             msg = "Okay, cancelled. Anything else?"
             conversation_store.append(thread, user_msg, AIMessage(content=msg))
@@ -788,9 +837,10 @@ async def run(
                 "tokens_used": 0,
             }
 
-        # Neither yes nor no — drop the stale proposal and treat this as new.
-        conversation_store.clear_pending(thread)
-        logger.info("supervisor dropped stale pending: reply was neither yes nor no")
+        else:
+            # Neither yes nor no — drop the stale proposal and treat this as new.
+            conversation_store.clear_pending(thread)
+            logger.info("supervisor dropped stale pending: reply was neither yes nor no")
 
     # 2) Determine intent. Try the LLM-based pre-router first — a confident
     # read intent ("show me all issues", "what is Alice working on") skips
@@ -990,11 +1040,27 @@ async def run(
         except Exception as e:
             logger.warning("supervisor: shape_message for UNKNOWN failed, using base: {}", e)
 
+    # If this turn ended by asking the user something, remember the question so
+    # the NEXT reply is resolved in context (the clarification branch at the top
+    # of run) instead of being classified cold. Writes propose their own pending
+    # and return earlier, so this only fires on reads / unknowns.
+    status = "executed"
+    reply_text = result.get("message", "")
+    if _looks_like_question(reply_text):
+        conversation_store.set_pending(thread, {
+            "kind": "clarification",
+            "question": reply_text,
+            "original_message": message,
+            "intent": intent_result.intent.value,
+        })
+        status = "needs_clarification"
+        logger.info("supervisor set clarification pending (read turn asked a question)")
+
     conversation_store.append(thread, user_msg, AIMessage(content=result["message"]))
     return {
         "intent": intent_result.intent.value,
         "result": result,
-        "status": "executed",
+        "status": status,
         "error": None,
         "tokens_used": request_tokens.total,
     }

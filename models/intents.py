@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class Intent(str, Enum):
@@ -19,7 +19,13 @@ class Intent(str, Enum):
 class IntentResult(BaseModel):
     intent: Intent
     confidence: float
-    entities: dict[str, Any]
+    # Defaults to {} when the model omits it. This matters for the pre-router,
+    # whose prompt asks for ONLY intent + confidence (no entity extraction) —
+    # without a default, every pre-router response failed validation
+    # ("entities Field required") and the pre-router silently deferred to the
+    # heavy classify chain on every message. classify still extracts entities;
+    # this just stops a missing field from collapsing a valid result to UNKNOWN.
+    entities: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("entities", mode="before")
     @classmethod

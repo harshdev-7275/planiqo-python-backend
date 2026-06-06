@@ -37,6 +37,20 @@ def _disable_persona_presentation() -> Any:
     settings.INSIGHT_ENABLED = prev_ins
 
 
+@pytest.fixture(autouse=True)
+def _defer_pre_router() -> Any:
+    """These are SUPERVISOR tests — they exercise the classify → dispatch path.
+    The pre-router is tested separately in tests/chains/test_pre_router.py.
+
+    Defer it to None by default so no test makes a live LLM pre-route call: the
+    pre-router now actually works (it used to fail schema validation and always
+    return None), so any direct ``run()`` without this would hit the real model.
+    Tests that need a specific pre-route result patch it locally.
+    """
+    with patch("agents.supervisor.pre_route", new=AsyncMock(return_value=None)):
+        yield
+
+
 def _intent(intent: Intent, **entities: Any) -> IntentResult:
     return IntentResult(intent=intent, confidence=0.95, entities=entities)
 
@@ -764,6 +778,112 @@ async def test_ambiguous_reply_after_proposal_reclassifies_as_new_request() -> N
     assert conversation_store.get_pending("u1:acme:-") is None
 
 
+# --- read clarification (issue #2) ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_question_sets_clarification_pending() -> None:
+    """When a read turn's reply ends in a question, the supervisor remembers it
+    as a 'clarification' pending so the NEXT reply can be resolved in context."""
+    issue_stub = AsyncMock(
+        return_value={"result": {"message": "Which issue did you mean?"}}
+    )
+    with (
+        patch("agents.supervisor.pre_route", new=AsyncMock(return_value=None)),
+        patch(
+            "agents.supervisor._shape_message",
+            new=AsyncMock(side_effect=lambda **kw: kw["base_text"]),
+        ),
+        patch(
+            "agents.supervisor.classify",
+            new=AsyncMock(return_value=_intent(Intent.QUERY_ISSUES)),
+        ),
+        patch("agents.issue_agent.run", new=issue_stub),
+    ):
+        from agents.supervisor import run
+
+        result = await run(message="who assigned to what", **BASE)
+
+    assert result["status"] == "needs_clarification"
+    pending = conversation_store.get_pending("u1:acme:-")
+    assert pending is not None
+    assert pending["kind"] == "clarification"
+    assert pending["question"] == "Which issue did you mean?"
+
+
+@pytest.mark.asyncio
+async def test_clarification_followup_is_resolved_in_context() -> None:
+    """A bare 'yes' answering a pending clarification is rewritten to a
+    standalone request and classified — NOT dead-ended as UNKNOWN.
+
+    This is the issue-#2 fix: the follow-up is interpreted WITH the prior
+    question's context instead of cold."""
+    conversation_store.set_pending("u1:acme:-", {
+        "kind": "clarification",
+        "question": "Would you like me to list project members?",
+        "original_message": "who assigned to what",
+        "intent": "QUERY_ISSUES",
+    })
+
+    member_stub = AsyncMock(return_value={"result": {"message": "Alice, Bob"}})
+    classify_mock = AsyncMock(return_value=_intent(Intent.QUERY_MEMBER))
+    with (
+        patch(
+            "agents.supervisor.resolve_followup",
+            new=AsyncMock(return_value="list project members"),
+        ),
+        patch("agents.supervisor.pre_route", new=AsyncMock(return_value=None)),
+        patch(
+            "agents.supervisor._shape_message",
+            new=AsyncMock(side_effect=lambda **kw: kw["base_text"]),
+        ),
+        patch("agents.supervisor.classify", new=classify_mock),
+        patch("agents.member_agent.run", new=member_stub),
+    ):
+        from agents.supervisor import run
+
+        result = await run(message="yes", **BASE)
+
+    # The rewritten message — not the bare "yes" — was what got classified.
+    classify_mock.assert_awaited_once()
+    assert classify_mock.await_args.args[0] == "list project members"
+    member_stub.assert_awaited_once()
+    assert result["status"] == "executed"
+    assert result["intent"] == "QUERY_MEMBER"
+    # The clarification pending was consumed (the member reply isn't a question).
+    assert conversation_store.get_pending("u1:acme:-") is None
+
+
+@pytest.mark.asyncio
+async def test_clarification_negation_cancels_without_resolving() -> None:
+    """'no' to a pending clarification cancels cleanly — no resolve, no
+    classify, no agent dispatch."""
+    conversation_store.set_pending("u1:acme:-", {
+        "kind": "clarification",
+        "question": "Would you like me to list project members?",
+        "original_message": "who assigned to what",
+        "intent": "QUERY_ISSUES",
+    })
+
+    with (
+        patch(
+            "agents.supervisor.resolve_followup",
+            new=AsyncMock(side_effect=AssertionError("must not resolve on cancel")),
+        ),
+        patch(
+            "agents.supervisor.classify",
+            new=AsyncMock(side_effect=AssertionError("must not classify on cancel")),
+        ),
+        patch("agents.issue_agent.run", new=AsyncMock()),
+    ):
+        from agents.supervisor import run
+
+        result = await run(message="no", **BASE)
+
+    assert result["status"] == "cancelled"
+    assert conversation_store.get_pending("u1:acme:-") is None
+
+
 # --- pending TTL -------------------------------------------------------------
 
 
@@ -1020,7 +1140,7 @@ async def test_rate_limit_during_classify_returns_friendly_message() -> None:
         patch("agents.sprint_agent.run", new=AsyncMock()),
     ):
         from agents.supervisor import run
-        # A message the pre-router can't classify, so it reaches the LLM call.
+        # pre_route is deferred by the autouse fixture, so this reaches classify.
         result = await run(message="what should I focus on today", **BASE)
     msg = result["result"]["message"].lower()
     assert "moment" in msg

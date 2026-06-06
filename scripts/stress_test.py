@@ -1,4 +1,4 @@
-"""Stress-test runner for the AI service.
+    """Stress-test runner for the AI service.
 
 Posts every query in ``stress_queries.json`` to ``POST /chat`` and prints
 a one-line summary per query (intent, status, response, tokens, latency).

@@ -13,7 +13,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from tools.issue_tools import CreateIssueTool, FindSimilarIssuesTool, UpdateIssueTool
+from tools.issue_tools import (
+    CreateIssueTool,
+    FindSimilarIssuesTool,
+    GetIssuesTool,
+    UpdateIssueTool,
+)
 
 CTX = {"org_slug": "acme", "project_id": "proj-1"}
 
@@ -37,6 +42,46 @@ def _api_for_create() -> AsyncMock:
     )
     api.post = AsyncMock(return_value={"number": 7, "title": "login bug"})
     return api
+
+
+# --- fix #1: get_issues surfaces assignee + status names --------------------
+
+
+@pytest.mark.asyncio
+async def test_get_issues_includes_assignee_and_status_names() -> None:
+    """The list line must carry the assignee + status NAME (not a raw ID), so
+    the agent can answer "who is assigned to what". Unassigned issues read
+    'Unassigned' rather than dropping the field."""
+    api = AsyncMock()
+    api.get_issues = AsyncMock(return_value=[
+        {"number": 1, "priority": "high", "title": "login bug",
+         "status": {"name": "In Progress"}, "assignee": {"name": "Alice"}},
+        {"number": 2, "priority": "low", "title": "typo in footer",
+         "status": {"name": "Todo"}, "assignee": None},
+    ])
+    tool = GetIssuesTool(api=api, **CTX)
+
+    out = await tool._arun()
+
+    assert "#1" in out and "login bug" in out
+    assert "Alice" in out and "In Progress" in out      # assignee + status shown
+    assert "#2" in out and "Unassigned" in out          # no assignee → Unassigned
+
+
+@pytest.mark.asyncio
+async def test_get_issues_degrades_when_relations_missing() -> None:
+    """Old/ID-only payloads (no status/assignee objects) must still produce a
+    usable line — 'No status' / 'Unassigned' — never a KeyError."""
+    api = AsyncMock()
+    api.get_issues = AsyncMock(return_value=[
+        {"number": 5, "priority": "medium", "title": "legacy shape"},
+    ])
+    tool = GetIssuesTool(api=api, **CTX)
+
+    out = await tool._arun()
+
+    assert "#5" in out and "legacy shape" in out
+    assert "No status" in out and "Unassigned" in out
 
 
 # --- item 3: embeddings are populated on create -----------------------------
