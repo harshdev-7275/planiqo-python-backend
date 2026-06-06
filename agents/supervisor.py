@@ -1,12 +1,15 @@
 """Conversation supervisor.
 
-Adds two stateful concerns on top of intent routing:
+Adds three stateful concerns on top of intent routing:
 
 1. **Memory** — per-thread windowed history (memory/store.py) is loaded on every
    turn and passed to the executing agent, and each turn is appended back.
 2. **Write confirmation** — intents that mutate data are *proposed* (a preview is
    returned) and only executed after the user replies "yes". This keeps a single
    misread message from silently creating or changing work items.
+3. **Persona-shaped reply** — the persona/presentation layer shapes how the
+   AI speaks (warmer UNKNOWN replies, PM-style previews, etc.) without
+   changing what the system does. See AIService.md § Voice without drift.
 
 Reads run immediately. The execution agents (issue/sprint) remain LangGraph
 ReAct agents; this module dispatches to them directly.
@@ -31,9 +34,15 @@ from agents.preview import (
     ground_sprint_name,
 )
 from agents.state import SupervisorState
+from chains.insight import generate_insight
 from chains.intent import classify
 from chains.normalizer import canonicalize_priority, normalize_entities
+from chains.persona_resolver import resolve_persona
 from chains.pre_router import pre_route
+from chains.presentation import (
+    generate_presentation,
+    render_presentation,
+)
 from chains.title_clean import clean_title
 from chains.yes_no import is_affirmation, is_negation
 from clients.neo4j_client import neo4j_client
@@ -549,6 +558,122 @@ async def _execute(
     return result if result else {"message": "No response."}
 
 
+# =============================================================================
+# PERSONA-SHAPED REPLIES
+# =============================================================================
+
+
+async def _shape_message(
+    *,
+    intent: Intent,
+    base_text: str,
+    user_message: str,
+    org_slug: str,
+    user_id: str,
+    callbacks: Callbacks = None,
+    data: Any = None,
+    data_block: dict[str, Any] | None = None,
+) -> str:
+    """Optionally wrap ``base_text`` in a persona-shaped Presentation.
+
+    Returns ``base_text`` unchanged when:
+      - the intent is in the presentation skip set (data queries use the
+        existing templated response, no LLM call)
+      - PRESENTATION_ENABLED is off
+      - the LLM call fails (we never crash the chat for personality)
+
+    When the LLM does run, it returns a Presentation with opener,
+    narrative, suggestions, closer — and we render it to a string. The
+    insight layer is also called (skipped on the same intents) so the
+    PM-style observation ("4 critical issues, #14 is the only login
+    blocker") can be woven into the reply.
+
+    The persona is resolved per (org, user) with a 5-min cache. The
+    insight + presentation are fresh every turn (they're not cached —
+    the data and the user message change).
+    """
+    if intent in (Intent.QUERY_ISSUES, Intent.QUERY_SPRINT, Intent.SUMMARIZE,
+                  Intent.UNKNOWN, Intent.TEAMS_CONTEXT):
+        # The data IS the answer for these; persona doesn't help.
+        # Exception: UNKNOWN gets the persona treatment (warm clarification)
+        if intent is not Intent.UNKNOWN:
+            return base_text
+    if not settings.PRESENTATION_ENABLED:
+        return base_text
+
+    try:
+        persona = resolve_persona(org_slug, user_id)
+    except Exception as e:
+        logger.warning("supervisor: persona resolve failed, using base text: {}", e)
+        return base_text
+
+    # Try to extract known issue numbers from the data for the insight
+    # filter (defence in depth against the LLM inventing numbers).
+    known_numbers: list[int] | None = None
+    if isinstance(data, dict):
+        nums = _extract_issue_numbers(data)
+        if nums:
+            known_numbers = nums
+
+    insight = None
+    if settings.INSIGHT_ENABLED:
+        try:
+            insight = await generate_insight(
+                intent=intent,
+                user_message=user_message,
+                data=str(data) if data is not None else base_text,
+                known_issue_numbers=known_numbers,
+                callbacks=callbacks,
+            )
+        except Exception as e:
+            logger.warning("supervisor: insight failed, continuing: {}", e)
+            insight = None
+
+    try:
+        presentation = await generate_presentation(
+            persona=persona,
+            intent=intent,
+            user_message=user_message,
+            data=data if data is not None else base_text,
+            insight=insight,
+            data_block=data_block,
+            callbacks=callbacks,
+        )
+    except Exception as e:
+        logger.warning("supervisor: presentation failed, using base text: {}", e)
+        return base_text
+
+    if presentation is None:
+        return base_text
+
+    return render_presentation(presentation, persona=persona)
+
+
+def _extract_issue_numbers(data: Any) -> list[int]:
+    """Best-effort pull of issue numbers from the structured data, so the
+    insight layer can ground its observations. Not exhaustive — we just
+    walk dicts and lists and collect ints that look like issue numbers."""
+    out: list[int] = []
+    _walk_for_ints(data, out, max_depth=4)
+    return out
+
+
+def _walk_for_ints(node: Any, out: list[int], max_depth: int) -> None:
+    if max_depth <= 0:
+        return
+    if isinstance(node, dict):
+        # Look for an "id" or "number" key (issue number) at this level.
+        for key in ("id", "number"):
+            v = node.get(key)
+            if isinstance(v, int) and 0 < v < 1_000_000:
+                out.append(v)
+        for v in node.values():
+            _walk_for_ints(v, out, max_depth - 1)
+    elif isinstance(node, list):
+        for v in node:
+            _walk_for_ints(v, out, max_depth - 1)
+
+
 # --- entry point -------------------------------------------------------------
 
 
@@ -798,6 +923,18 @@ async def run(
     # 3) Writes are proposed, not executed, until the user confirms.
     if intent_result.intent in WRITE_INTENTS:
         preview = _preview(intent_result)
+        # Persona-shaped preview (PM-style). Falls back to the templated
+        # preview if the LLM call fails or the feature is off. The
+        # underlying entities are unchanged — drift-test invariant.
+        preview = await _shape_message(
+            intent=intent_result.intent,
+            base_text=preview,
+            user_message=message,
+            org_slug=org_slug,
+            user_id=user_id,
+            callbacks=callbacks,
+            data=intent_result.entities,
+        ) or preview
         conversation_store.set_pending(thread, {
             "intent": intent_result.intent.value,
             "message": message,
@@ -835,6 +972,24 @@ async def run(
             intent_result.intent.value, e, exc_info=True,
         )
         result = {"message": _error_message(e)}
+
+    # 4a) Persona-shaped reply for UNKNOWN. Other intents use the agent's
+    # templated result as-is (data is the answer; prose doesn't help).
+    if intent_result.intent == Intent.UNKNOWN:
+        try:
+            shaped = await _shape_message(
+                intent=Intent.UNKNOWN,
+                base_text=result.get("message", _UNKNOWN_MESSAGE),
+                user_message=message,
+                org_slug=org_slug,
+                user_id=user_id,
+                callbacks=callbacks,
+            )
+            if shaped:
+                result = {"message": shaped}
+        except Exception as e:
+            logger.warning("supervisor: shape_message for UNKNOWN failed, using base: {}", e)
+
     conversation_store.append(thread, user_msg, AIMessage(content=result["message"]))
     return {
         "intent": intent_result.intent.value,
