@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from config.settings import settings
 from memory.store import conversation_store
 from metering.usage import usage_store
 from models.intents import Intent, IntentResult
@@ -18,6 +19,22 @@ def _isolate_store() -> Any:
     yield
     conversation_store.reset_all()
     usage_store.reset_all()
+
+
+@pytest.fixture(autouse=True)
+def _disable_persona_presentation() -> Any:
+    """The persona/presentation layer is tested separately in
+    tests/chains/test_persona_*.py and tests/chains/test_presentation.py.
+    The supervisor tests exercise the *preview shape* and the *execute
+    path*; the LLM rewrite would hide the contracts those tests pin down.
+    """
+    prev_pres = settings.PRESENTATION_ENABLED
+    prev_ins  = settings.INSIGHT_ENABLED
+    settings.PRESENTATION_ENABLED = False
+    settings.INSIGHT_ENABLED = False
+    yield
+    settings.PRESENTATION_ENABLED = prev_pres
+    settings.INSIGHT_ENABLED = prev_ins
 
 
 def _intent(intent: Intent, **entities: Any) -> IntentResult:
@@ -46,6 +63,15 @@ async def _run(
         # classify + metering path. Tests that want to exercise the pre-router
         # itself patch it separately.
         patch("agents.supervisor.pre_route", new=AsyncMock(return_value=None)),
+        # Disable persona/presentation shaping in this test helper — the
+        # persona layer is tested separately in tests/chains/test_persona_*
+        # and tests/chains/test_presentation.py. The supervisor tests
+        # exercise the *preview shape* and the *execute path*, which would
+        # be hidden by the LLM rewrite.
+        patch(
+            "agents.supervisor._shape_message",
+            new=AsyncMock(side_effect=lambda **kw: kw["base_text"]),
+        ),
         patch(
             "agents.supervisor.classify",
             new=AsyncMock(return_value=_intent(intent, **default_entities)),

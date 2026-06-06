@@ -85,6 +85,20 @@ class Settings(BaseSettings):
     EMBEDDING_PROVIDER: Literal["noop", "google"] = "noop"
     GOOGLE_AI_API_KEY: str = ""
 
+    # ── Persona / Presentation / Insight (NEW) ────────────────────────
+    # Global default persona. Org/user/thread override this. See
+    # chains/persona_resolver.py for the resolution chain.
+    PERSONA_DEFAULT: Literal["senior_pm", "auditor", "assistant"] = "senior_pm"
+    # Cache persona resolution per (org_slug, user_id) for N seconds.
+    # Set to 0 to disable caching (resolve every turn — slow, but never stale).
+    PERSONA_CACHE_TTL_SECONDS: int = 300
+    # Master switch for the insight layer (chains/insight.py).
+    INSIGHT_ENABLED: bool = True
+    # Master switch for the presentation layer (chains/presentation.py).
+    PRESENTATION_ENABLED: bool = True
+    # Confidence gate for insights (below this the insight is dropped).
+    INSIGHT_MIN_CONFIDENCE: float = 0.6
+
     model_config = {"env_file": ".env", "extra": "ignore"}
 
 
