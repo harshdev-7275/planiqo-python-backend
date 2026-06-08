@@ -9,6 +9,7 @@ from loguru import logger
 from pydantic import BaseModel
 
 from agents import supervisor
+from chains.render_contract import attach_render_blocks
 from clients.neo4j_client import neo4j_client
 from clients.node_api import node_api_client
 from config.settings import settings
@@ -134,11 +135,14 @@ async def metrics() -> dict[str, Any]:
 async def chat(body: ChatRequest) -> dict[str, Any]:
     start = time.perf_counter()
     try:
-        return await supervisor.run(
+        response = await supervisor.run(
             message=body.message,
             user_id=body.user_id,
             org_slug=body.org_slug,
             project_id=body.project_id,
         )
+        # Service edge: guarantee the reply carries validated, camelCase
+        # render blocks (at least a prose block) for the frontend renderer.
+        return attach_render_blocks(response)
     finally:
         latency_stats.record((time.perf_counter() - start) * 1000)

@@ -98,6 +98,12 @@ class Settings(BaseSettings):
     PRESENTATION_ENABLED: bool = True
     # Confidence gate for insights (below this the insight is dropped).
     INSIGHT_MIN_CONFIDENCE: float = 0.6
+    # Opt-in: run the LLM block emitter (chains/block_emitter.py) for
+    # structured read intents so replies render as PM blocks (tables, cards,
+    # health reports) instead of plain prose. Off by default — it adds an LLM
+    # call per structured read. The summarize path emits blocks deterministically
+    # regardless of this flag.
+    RENDER_BLOCKS_LLM_ENABLED: bool = False
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 

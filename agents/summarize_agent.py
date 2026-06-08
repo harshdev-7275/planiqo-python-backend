@@ -8,16 +8,32 @@ The pure ``_format_sprint_summary`` does all the shaping and is unit-tested with
 plain dicts; ``run`` is the thin I/O wrapper that fetches and resolves the sprint.
 """
 
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.callbacks import Callbacks
 from loguru import logger
 
 from agents.state import SupervisorState
 from clients.node_api import node_api_client
+from models.blocks import (
+    Block,
+    BreakdownBlock,
+    BreakdownSegment,
+    ProgressBlock,
+    ProseBlock,
+)
 
 # Fixed display order for the priority line so output is deterministic.
 _PRIORITY_ORDER = ("critical", "high", "medium", "low")
+
+# Severity tone per priority for the breakdown bars (matches the render
+# contract's tone vocabulary).
+_PRIORITY_TONE: dict[str, Literal["neutral", "good", "warn", "bad"]] = {
+    "critical": "bad",
+    "high": "warn",
+    "medium": "neutral",
+    "low": "good",
+}
 
 
 def _date_only(value: str | None) -> str:
@@ -75,6 +91,60 @@ def _format_sprint_summary(
         f"Status: {', '.join(status_lines)}\n"
         f"Priority: {', '.join(priority_lines)}"
     )
+
+
+def _summary_blocks(
+    sprint: dict[str, Any], issues: list[dict[str, Any]], statuses: list[dict[str, Any]]
+) -> list[Block]:
+    """Visual blocks for the sprint summary — the structured twin of
+    ``_format_sprint_summary``. Deterministic, zero-LLM. Recomputes the same
+    aggregates (kept separate so the battle-tested text formatter is untouched);
+    the message string stays the text fallback, these blocks are what the UI
+    renders.
+    """
+    name = sprint.get("name") or "the sprint"
+    state = sprint.get("status") or "?"
+    span = f"{_date_only(sprint.get('startDate'))} → {_date_only(sprint.get('endDate'))}"
+    blocks: list[Block] = [ProseBlock(markdown=f"**Sprint '{name}'** ({state}) — {span}")]
+
+    total = len(issues)
+    if total == 0:
+        blocks.append(ProseBlock(markdown="This sprint has no issues yet."))
+        return blocks
+
+    status_by_id = {s["id"]: s for s in statuses}
+    done = sum(1 for i in issues if _is_done(i, status_by_id))
+    blocks.append(ProgressBlock(kind="sprint", title="Progress", completed=done, total=total))
+
+    # Status breakdown in the project's own status order, then anything unmapped.
+    status_segments: list[BreakdownSegment] = []
+    for s in statuses:
+        count = sum(1 for i in issues if i.get("statusId") == s["id"])
+        if count:
+            status_segments.append(BreakdownSegment(label=s["name"], value=count))
+    known_ids = {s["id"] for s in statuses}
+    other = sum(1 for i in issues if i.get("statusId") not in known_ids)
+    if other:
+        status_segments.append(BreakdownSegment(label="Other", value=other))
+    if status_segments:
+        blocks.append(
+            BreakdownBlock(title="Status", dimension="status", segments=status_segments)
+        )
+
+    # Priority breakdown in fixed severity order, tinted by severity.
+    priority_segments: list[BreakdownSegment] = []
+    for p in _PRIORITY_ORDER:
+        count = sum(1 for i in issues if i.get("priority") == p)
+        if count:
+            priority_segments.append(
+                BreakdownSegment(label=p, value=count, tone=_PRIORITY_TONE[p])
+            )
+    if priority_segments:
+        blocks.append(
+            BreakdownBlock(title="Priority", dimension="priority", segments=priority_segments)
+        )
+
+    return blocks
 
 
 def _resolve_sprint(sprints: list[dict[str, Any]], query: str | None) -> dict[str, Any] | None:
@@ -156,5 +226,6 @@ async def run(state: SupervisorState, callbacks: Callbacks = None) -> dict[str, 
         )}}
 
     summary = _format_sprint_summary(sprint, sprint_issues, statuses)
+    blocks = _summary_blocks(sprint, sprint_issues, statuses)
     logger.info("summarize_agent summarized '{}' ({} issues)", sprint.get("name"), len(sprint_issues))
-    return {"result": {"message": summary}}
+    return {"result": {"message": summary, "blocks": [b.model_dump() for b in blocks]}}

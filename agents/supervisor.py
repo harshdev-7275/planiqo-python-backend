@@ -34,6 +34,7 @@ from agents.preview import (
     ground_sprint_name,
 )
 from agents.state import SupervisorState
+from chains.block_emitter import EMIT_INTENTS, emit_blocks
 from chains.followup_resolver import resolve_followup
 from chains.insight import generate_insight
 from chains.intent import classify
@@ -1039,6 +1040,24 @@ async def run(
                 result = {"message": shaped}
         except Exception as e:
             logger.warning("supervisor: shape_message for UNKNOWN failed, using base: {}", e)
+
+    # Generative block pass for structured reads (opt-in via
+    # RENDER_BLOCKS_LLM_ENABLED). emit_blocks returns None when the flag is off,
+    # the intent isn't structured, or the model produced nothing better than
+    # prose — in which case the service-edge prose carrier still renders the
+    # message. Never let a failed block pass break the reply.
+    if intent_result.intent in EMIT_INTENTS:
+        try:
+            emitted = await emit_blocks(
+                intent=intent_result.intent,
+                user_message=message,
+                answer=result.get("message", ""),
+                callbacks=callbacks,
+            )
+            if emitted:
+                result["blocks"] = [b.model_dump() for b in emitted]
+        except Exception as e:
+            logger.warning("supervisor: block emit failed, using prose carrier: {}", e)
 
     # If this turn ended by asking the user something, remember the question so
     # the NEXT reply is resolved in context (the clarification branch at the top
