@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, patch
 
-from agents.summarize_agent import _format_sprint_summary, run
+from agents.summarize_agent import _format_sprint_summary, _summary_blocks, run
 from models.intents import Intent, IntentResult
 
 _STATUSES = [
@@ -145,3 +145,32 @@ async def test_run_swallows_node_api_500_on_get_issues() -> None:
         api.get_statuses = AsyncMock(return_value=_STATUSES)
         out = await run(_state({"sprint": "Sprint 2"}))
     assert "couldn't" in out["result"]["message"].lower() or "server" in out["result"]["message"].lower()
+
+
+# --- render blocks (the structured twin of the text summary) ---------------
+
+
+def test_summary_blocks_has_progress_and_two_breakdowns():
+    issues = [_issue(1, "s-done", "high"), _issue(2, "s-todo", "low"), _issue(3, "s-prog", "critical")]
+    blocks = _summary_blocks(_SPRINT, issues, _STATUSES)
+    types = [b.type for b in blocks]
+    assert "progress" in types
+    assert types.count("breakdown") == 2  # status + priority
+
+
+def test_summary_blocks_empty_sprint_is_prose_only():
+    blocks = _summary_blocks(_SPRINT, [], _STATUSES)
+    assert all(b.type == "prose" for b in blocks)
+
+
+@pytest.mark.asyncio
+async def test_run_attaches_render_blocks():
+    with patch("agents.summarize_agent.node_api_client") as api:
+        api.get_sprints = AsyncMock(return_value=[_SPRINT])
+        api.get_issues = AsyncMock(return_value=[_issue(1, "s-done", "high"), _issue(2, "s-todo", "low")])
+        api.get_statuses = AsyncMock(return_value=_STATUSES)
+        api.get_active_sprint = AsyncMock(return_value=None)
+        out = await run(_state({"sprint": "Sprint 2"}))
+    blocks = out["result"]["blocks"]
+    assert isinstance(blocks, list)
+    assert any(b["type"] == "progress" for b in blocks)
