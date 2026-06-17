@@ -12,6 +12,7 @@ the structured JSON logs so log pipelines can ingest them.
 from __future__ import annotations
 
 import hmac
+import re
 from typing import Any
 from uuid import UUID
 
@@ -20,6 +21,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langgraph.errors import GraphRecursionError
 
 from ai_service.agents import AgentDeps, get_or_build_graph
+from ai_service.agents.callbacks import ToolLoggingCallbackHandler
 from ai_service.agents.registry import get_agent_spec
 from ai_service.config import get_settings
 from ai_service.core.errors import ConfigurationError
@@ -29,11 +31,17 @@ from ai_service.schemas import ChatRequest, ChatResponse, ChatTurn, ToolCallReco
 # Cap how many prior turns we replay into the agent. The client may send up to
 # 50 (schema limit); we keep the most recent ones to bound prompt size and cost.
 _MAX_HISTORY_TURNS = 20
-# Width of the dev-mode console block (chars between the border rules).
-_DEV_LOG_WIDTH = 72
-# Tool result previews in the dev log are clipped so one huge payload can't
-# flood the console. The schema field is already documented as "~200 chars".
+# Tool result previews in the audit trail are clipped so one huge payload can't
+# bloat the response. The schema field is already documented as "~200 chars".
 _TOOL_RESULT_PREVIEW_CHARS = 200
+
+# Reasoning models (e.g. MiniMax-M2) emit their chain-of-thought wrapped in
+# <think>...</think> inside the message content. We strip it before returning so
+# the user never sees raw reasoning. Matches complete blocks, a trailing
+# unclosed block (truncated output), and any stray tags.
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_TRAILING_RE = re.compile(r"<think>.*$", re.DOTALL | re.IGNORECASE)
+_THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
 
 
 logger = get_logger(__name__)
@@ -156,10 +164,13 @@ async def chat(
     )
 
     history = _history_to_messages(body.history)
+    # Per-turn observability: logs each tool call (incl. Neo4j graph tools) and
+    # model round-trip, correlated by request_id.
+    callbacks = [ToolLoggingCallbackHandler()]
 
     try:
         result: dict[str, Any] = await _invoke_async(
-            graph, body.message, deps, project_id_str, project_label, history
+            graph, body.message, deps, project_id_str, project_label, history, callbacks
         )
     except ConfigurationError as exc:
         logger.exception("chat.config_error")
@@ -189,9 +200,9 @@ async def chat(
             detail="The agent failed to process the request. Try again or rephrase.",
         ) from None
 
-    # Pull the final answer (last message in the run).
+    # Pull the final answer (last message in the run), stripped of any reasoning.
     final = result["messages"][-1]
-    answer = _content_to_text(getattr(final, "content", ""))
+    answer = _strip_reasoning(_content_to_text(getattr(final, "content", "")))
 
     # Build a tool_call_id -> result preview map so each audit row can show
     # what the tool returned (clipped to keep the response payload small).
@@ -216,19 +227,21 @@ async def chat(
                     )
                 )
 
-    # Dev-only: write a single pretty-printed block summarising the turn.
-    # Production keeps the structured JSON logs for ingestion.
-    if settings.app_env == "development":
-        logger.info(
-            _format_chat_log(
-                user_query=body.message,
-                tool_calls=tool_calls,
-                answer=answer,
-                model=model_id,
-                steps=len(result["messages"]),
-                scope=project_id_str,
-            )
-        )
+    # One structured line per turn. No message content / answer text is logged
+    # (it is user data) — only operational metadata for monitoring and cost.
+    logger.info(
+        "chat.completed",
+        extra={
+            "agent": spec.name,
+            "model": model_id,
+            "steps": len(result["messages"]),
+            "tool_call_count": len(tool_calls),
+            "tools_used": [tc.tool for tc in tool_calls],
+            "scoped": project_id_str is not None,
+            "message_chars": len(body.message),
+            "history_turns": len(body.history),
+        },
+    )
 
     return ChatResponse(
         message=answer,
@@ -280,6 +293,7 @@ async def _invoke_async(
     project_id_str: str | None,
     project_label: str | None = None,
     history: list[BaseMessage] | None = None,
+    callbacks: list[Any] | None = None,
 ) -> dict[str, Any]:
     from ai_service.agents.pm_agent import arun_agent
 
@@ -292,7 +306,24 @@ async def _invoke_async(
         project_id=project_id_str,
         project_label=project_label,
         history=history,
+        callbacks=callbacks,
     )
+
+
+def _strip_reasoning(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks from a model answer.
+
+    Handles complete blocks, a trailing unclosed block (truncated generation),
+    and stray tags. If the message was *only* reasoning, returns that text with
+    the tags removed rather than an empty string, so the user never sees a blank
+    reply.
+    """
+    cleaned = _THINK_BLOCK_RE.sub("", text)
+    cleaned = _THINK_TRAILING_RE.sub("", cleaned)
+    cleaned = _THINK_TAG_RE.sub("", cleaned).strip()
+    if cleaned:
+        return cleaned
+    return _THINK_TAG_RE.sub("", text).strip()
 
 
 def _content_to_text(content: Any) -> str:
@@ -312,61 +343,4 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
-# ---------------------------------------------------------------------------
-# Dev-mode console formatter
-# ---------------------------------------------------------------------------
-
-
-def _format_chat_log(
-    *,
-    user_query: str,
-    tool_calls: list[ToolCallRecord],
-    answer: str,
-    model: str,
-    steps: int,
-    scope: str | None = None,
-) -> str:
-    """Build a single multi-line, pretty-printed summary of one chat turn.
-
-    Used by the dev console. Production skips this entirely and relies on the
-    structured JSON logs configured in `ai_service.logging`.
-
-    The output is intentionally one string so it goes through the standard
-    logger (preserving level, handler, propagation) rather than `print()`.
-    """
-    rule = "─" * _DEV_LOG_WIDTH
-    indent = "  "
-    lines: list[str] = [rule, "💬 CHAT REQUEST"]
-
-    query = user_query.replace("\n", " ").strip()
-    lines.append(f"{indent}Query : {query}")
-    lines.append(f"{indent}Scope : {scope if scope else 'all projects'}")
-    lines.append(f"{indent}Model : {model}")
-    lines.append(f"{indent}Steps : {steps}")
-    lines.append("")
-
-    if tool_calls:
-        lines.append(f"🔧 TOOL CALLS ({len(tool_calls)})")
-        for index, tc in enumerate(tool_calls, start=1):
-            lines.append(f"{indent}[{index}] {tc.tool}")
-            if tc.args:
-                args_repr = ", ".join(f"{k}={v!r}" for k, v in tc.args.items())
-                lines.append(f"{indent}    args   : {args_repr}")
-            if tc.result_preview:
-                preview_one_line = tc.result_preview.replace("\n", " ⏎ ")
-                lines.append(f"{indent}    result : {preview_one_line}")
-            lines.append("")
-    else:
-        lines.append("🔧 TOOL CALLS: (none)")
-        lines.append("")
-
-    lines.append("🤖 AI RESPONSE")
-    answer_text = answer.strip() or "(empty)"
-    for chunk in answer_text.split("\n"):
-        lines.append(f"{indent}{chunk}")
-
-    lines.append(rule)
-    return "\n".join(lines)
-
-
-__all__ = ["_format_chat_log", "get_agent_deps", "router"]
+__all__ = ["get_agent_deps", "router"]

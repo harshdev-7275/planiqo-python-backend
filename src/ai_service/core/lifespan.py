@@ -34,7 +34,13 @@ async def lifespan(app: FastAPI, settings: Settings) -> AsyncIterator[None]:
     2. Open node-backend HTTP client (required for any data access).
     3. Open Neo4j driver (optional — only if configured).
     """
-    configure_logging(level=settings.log_level, json_output=settings.app_env != "development")
+    configure_logging(
+        level=settings.log_level,
+        json_output=settings.app_env != "development",
+        service=settings.app_name,
+        version=settings.app_version,
+        environment=settings.app_env,
+    )
 
     logger.info(
         "service.starting",

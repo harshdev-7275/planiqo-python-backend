@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 from ai_service import __version__
 from ai_service.api import api_router
 from ai_service.config import Settings, get_settings
-from ai_service.core import AppError, lifespan
+from ai_service.core import AppError, RequestLoggingMiddleware, lifespan
 from ai_service.logging import get_logger
 
 logger = get_logger(__name__)
@@ -54,6 +54,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # Request logging is added last so it is the OUTERMOST middleware: every
+    # request gets a correlation id and a structured access log, even CORS
+    # preflights and anything the inner stack rejects.
+    app.add_middleware(RequestLoggingMiddleware)
 
     # --- Exception handlers ---
     @app.exception_handler(AppError)

@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, HumanMessage, ToolCall, ToolMessage
 
-from ai_service.api.chat import get_agent_deps, router
+from ai_service.api.chat import _strip_reasoning, get_agent_deps, router
 
 
 def _configured_settings_mock(app_env: str = "production") -> MagicMock:
@@ -54,6 +54,27 @@ def _fake_graph_result(
         "project_id": None,
         "user_id": "00000000-0000-0000-0000-000000000002",
     }
+
+
+class TestStripReasoning:
+    def test_removes_complete_think_block(self) -> None:
+        text = "<think>let me check the issues</think>You have 28 open issues."
+        assert _strip_reasoning(text) == "You have 28 open issues."
+
+    def test_removes_multiple_blocks_and_is_case_insensitive(self) -> None:
+        text = "<THINK>a</THINK>Answer one. <think>b</think>Answer two."
+        assert _strip_reasoning(text) == "Answer one. Answer two."
+
+    def test_removes_trailing_unclosed_block(self) -> None:
+        text = "Here is the answer.\n<think>reasoning that got cut off"
+        assert _strip_reasoning(text) == "Here is the answer."
+
+    def test_passes_through_text_without_tags(self) -> None:
+        assert _strip_reasoning("Just a normal answer.") == "Just a normal answer."
+
+    def test_reasoning_only_falls_back_to_untagged_text(self) -> None:
+        # Degenerate: the model produced only reasoning, no answer.
+        assert _strip_reasoning("<think>only reasoning</think>") == "only reasoning"
 
 
 class TestAgentSelection:
@@ -114,6 +135,22 @@ class TestChatEndpoint:
         assert body["message"] == "Hello from PM!"
         assert body["model"] == "groq:llama-3.3-70b-versatile"
         assert body["steps"] == 1
+
+    def test_strips_think_tags_from_response_message(self) -> None:
+        """A model answer containing <think> reasoning must be cleaned before return."""
+        app = _build_app()
+        raw = "<think>I should list issues, the scope is NP</think>You have 28 open issues."
+        with (
+            patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
+            patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
+            TestClient(app) as client,
+        ):
+            mock_graph = MagicMock()
+            mock_graph.ainvoke = AsyncMock(return_value=_fake_graph_result(raw))
+            mock_graph_factory.return_value = mock_graph
+            response = client.post("/v1/chat", json={"message": "list open issues"})
+        assert response.status_code == 200
+        assert response.json()["message"] == "You have 28 open issues."
 
     def test_rejects_empty_message(self) -> None:
         app = _build_app()
@@ -296,6 +333,30 @@ class TestChatEndpoint:
             )
         assert response.status_code == 422
 
+    def test_attaches_tool_logging_callback_to_run(self) -> None:
+        """The chat run must carry a callback handler so tool calls are logged."""
+        from ai_service.agents.callbacks import ToolLoggingCallbackHandler
+
+        app = _build_app()
+        captured: dict[str, Any] = {}
+
+        async def fake_ainvoke(state: dict[str, Any], *args: Any, **kwargs: Any) -> dict[str, Any]:
+            captured["config"] = kwargs.get("config")
+            return _fake_graph_result("ok")
+
+        with (
+            patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
+            patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
+            TestClient(app) as client,
+        ):
+            mock_graph = MagicMock()
+            mock_graph.ainvoke = fake_ainvoke
+            mock_graph_factory.return_value = mock_graph
+            response = client.post("/v1/chat", json={"message": "hi"})
+        assert response.status_code == 200
+        callbacks = captured["config"]["callbacks"]
+        assert any(isinstance(cb, ToolLoggingCallbackHandler) for cb in callbacks)
+
     def test_returns_graceful_message_on_recursion_limit(self) -> None:
         """A GraphRecursionError must yield a friendly 200, not a 502."""
         from langgraph.errors import GraphRecursionError
@@ -342,8 +403,8 @@ class TestChatEndpoint:
         assert body["tool_calls"][0]["tool"] == "list_issues"
         assert body["tool_calls"][0]["args"] == {"project_id": "abc"}
 
-    def test_logs_formatted_chat_block_in_dev_mode(self, caplog: pytest.LogCaptureFixture) -> None:
-        """In dev, the chat handler logs a single formatted block with query/tools/answer."""
+    def test_logs_structured_chat_completed_event(self, caplog: pytest.LogCaptureFixture) -> None:
+        """One structured `chat.completed` line is emitted with operational metadata."""
         tool_call = ToolCall(name="list_issues", args={"project_id": "abc"}, id="call_1")
         tool_result = ToolMessage(content='[{"id":"ISS-1","title":"Fix bug"}]', tool_call_id="call_1")
         messages = [
@@ -355,10 +416,7 @@ class TestChatEndpoint:
         app = _build_app()
         with (
             caplog.at_level("INFO", logger="ai_service.api.chat"),
-            patch(
-                "ai_service.api.chat.get_settings",
-                return_value=_configured_settings_mock(app_env="development"),
-            ),
+            patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
             patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
             TestClient(app) as client,
         ):
@@ -369,36 +427,37 @@ class TestChatEndpoint:
             mock_graph_factory.return_value = mock_graph
             response = client.post("/v1/chat", json={"message": "what's open?"})
         assert response.status_code == 200
-        joined = "\n".join(record.getMessage() for record in caplog.records)
-        assert "what's open?" in joined
-        assert "list_issues" in joined
-        assert "project_id" in joined
-        assert "ISS-1" in joined  # tool result preview
-        assert "There is 1 open issue" in joined
-        assert "CHAT REQUEST" in joined
-        assert "TOOL CALLS" in joined
-        assert "AI RESPONSE" in joined
+        records = [r for r in caplog.records if r.getMessage() == "chat.completed"]
+        assert len(records) == 1
+        rec = records[0]
+        assert rec.agent == "pm"  # type: ignore[attr-defined]
+        assert rec.tool_call_count == 1  # type: ignore[attr-defined]
+        assert rec.tools_used == ["list_issues"]  # type: ignore[attr-defined]
+        assert rec.scoped is False  # type: ignore[attr-defined]
 
-    def test_does_not_log_formatted_block_in_production(self, caplog: pytest.LogCaptureFixture) -> None:
-        """In production, the chat handler must NOT emit the dev console block."""
+    def test_does_not_log_user_message_or_answer_content(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """User message text and the answer must never appear in logs (PII)."""
         app = _build_app()
         with (
             caplog.at_level("INFO", logger="ai_service.api.chat"),
-            patch(
-                "ai_service.api.chat.get_settings",
-                return_value=_configured_settings_mock(app_env="production"),
-            ),
+            patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
             patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
             TestClient(app) as client,
         ):
             mock_graph = MagicMock()
-            mock_graph.ainvoke = AsyncMock(return_value=_fake_graph_result("ok"))
+            mock_graph.ainvoke = AsyncMock(
+                return_value=_fake_graph_result("the secret answer")
+            )
             mock_graph_factory.return_value = mock_graph
-            response = client.post("/v1/chat", json={"message": "hi"})
+            response = client.post("/v1/chat", json={"message": "my secret question"})
         assert response.status_code == 200
-        joined = "\n".join(record.getMessage() for record in caplog.records)
-        assert "CHAT REQUEST" not in joined
-        assert "AI RESPONSE" not in joined
+        joined = "\n".join(
+            record.getMessage() + str(record.__dict__) for record in caplog.records
+        )
+        assert "my secret question" not in joined
+        assert "the secret answer" not in joined
 
     def test_populates_tool_result_preview_from_tool_message(self) -> None:
         """ToolCallRecord.result_preview must be filled from the matching ToolMessage."""

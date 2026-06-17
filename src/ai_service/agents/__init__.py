@@ -5,6 +5,7 @@ To add a new agent: declare an ``AgentSpec`` and ``register_agent`` it in
 """
 
 from ai_service.agents.base import AgentSpec, GraphFactory, ToolSelector
+from ai_service.agents.callbacks import ToolLoggingCallbackHandler
 from ai_service.agents.deps import AgentDeps
 from ai_service.agents.pm_agent import (
     AgentState,
@@ -30,6 +31,7 @@ __all__ = [
     "AgentSpec",
     "AgentState",
     "GraphFactory",
+    "ToolLoggingCallbackHandler",
     "ToolSelector",
     "available_agents",
     "build_all_tools",

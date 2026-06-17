@@ -171,6 +171,14 @@ def _seed_messages(
     return [*(history or []), HumanMessage(content=message)]
 
 
+def _run_config(callbacks: list[Any] | None) -> dict[str, Any]:
+    """Build the LangGraph run config: bounded recursion + optional callbacks."""
+    config: dict[str, Any] = {"recursion_limit": _RECURSION_LIMIT}
+    if callbacks:
+        config["callbacks"] = callbacks
+    return config
+
+
 def run_agent(
     graph: Any,
     message: str,
@@ -181,6 +189,7 @@ def run_agent(
     project_id: str | None = None,
     project_label: str | None = None,
     history: list[BaseMessage] | None = None,
+    callbacks: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Invoke the agent graph and return the final state.
 
@@ -190,6 +199,9 @@ def run_agent(
 
     `project_label` is the human-readable name of the scoped project; when set
     it is surfaced to the model via the system prompt.
+
+    `callbacks` are LangChain callback handlers (e.g. tool-logging) attached to
+    the run for observability.
 
     Returns the full state dict so callers can extract the final message,
     tool calls, and any other state they care about.
@@ -204,7 +216,7 @@ def run_agent(
     }
     return cast(
         "dict[str, Any]",
-        graph.invoke(state, config={"recursion_limit": _RECURSION_LIMIT}),
+        graph.invoke(state, config=_run_config(callbacks)),
     )
 
 
@@ -218,6 +230,7 @@ async def arun_agent(
     project_id: str | None = None,
     project_label: str | None = None,
     history: list[BaseMessage] | None = None,
+    callbacks: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Async version of run_agent."""
     state: AgentState = {
@@ -230,7 +243,7 @@ async def arun_agent(
     }
     return cast(
         "dict[str, Any]",
-        await graph.ainvoke(state, config={"recursion_limit": _RECURSION_LIMIT}),
+        await graph.ainvoke(state, config=_run_config(callbacks)),
     )
 
 
