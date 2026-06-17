@@ -19,7 +19,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
 
-from ai_service.agents import AgentDeps, build_all_tools, get_or_build_graph
+from ai_service.agents import AgentDeps, get_or_build_graph
+from ai_service.agents.registry import get_agent_spec
 from ai_service.config import get_settings
 from ai_service.core.errors import ConfigurationError
 from ai_service.logging import get_logger
@@ -115,23 +116,33 @@ async def chat(
             ),
         )
 
+    # Resolve which agent to run (defaults to the PM agent). Unknown names are
+    # a client error, not a server error.
+    try:
+        spec = get_agent_spec(body.agent)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+
     # Scope to the requested project if provided.
     project_id_str: str | None = None
     if body.project_id is not None:
         deps.project_id = body.project_id
         project_id_str = str(body.project_id)
 
-    # Build tools per-request (they capture org_slug from deps).
-    # Graph tools are included when Neo4j is configured on app.state.
+    # Build tools per-request (they capture org_slug from deps). The agent's
+    # spec decides which tools it gets. Graph tools are included when Neo4j is
+    # configured on app.state.
     neo4j_client = getattr(request.app.state, "neo4j", None)
-    tools = build_all_tools(
+    tools = spec.select_tools(
         deps.node_backend,
         deps.org_slug,
         neo4j_client=neo4j_client,
         org_id=str(deps.org_id),
         scoped_project_id=project_id_str,
     )
-    graph = get_or_build_graph(tools, settings)
+    graph = get_or_build_graph(tools, settings, spec=spec)
 
     model_id = (
         settings.llm_provider

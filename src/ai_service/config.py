@@ -85,7 +85,7 @@ class Settings(BaseSettings):
         description="Shared service-to-service auth token. Must match AI_SERVICE_TOKEN in node-backend.",
     )
     node_backend_timeout_sec: float = Field(
-        default=30.0, gt=0, description="HTTP timeout for node-backend calls."
+        default=90.0, gt=0, description="HTTP timeout for node-backend calls."
     )
 
     # --- LLM providers (Groq + MiniMax) ---

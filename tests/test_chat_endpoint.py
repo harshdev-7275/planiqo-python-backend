@@ -56,13 +56,53 @@ def _fake_graph_result(
     }
 
 
+class TestAgentSelection:
+    def test_defaults_to_pm_agent_and_passes_spec_to_graph(self) -> None:
+        """No `agent` field → PM spec is resolved and handed to the graph factory."""
+        app = _build_app()
+        with (
+            patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
+            patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
+            TestClient(app) as client,
+        ):
+            mock_graph = MagicMock()
+            mock_graph.ainvoke = AsyncMock(return_value=_fake_graph_result("ok"))
+            mock_graph_factory.return_value = mock_graph
+            response = client.post("/v1/chat", json={"message": "hi"})
+        assert response.status_code == 200
+        spec = mock_graph_factory.call_args.kwargs["spec"]
+        assert spec.name == "pm"
+
+    def test_explicit_pm_agent_works(self) -> None:
+        app = _build_app()
+        with (
+            patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
+            patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
+            TestClient(app) as client,
+        ):
+            mock_graph = MagicMock()
+            mock_graph.ainvoke = AsyncMock(return_value=_fake_graph_result("ok"))
+            mock_graph_factory.return_value = mock_graph
+            response = client.post("/v1/chat", json={"message": "hi", "agent": "pm"})
+        assert response.status_code == 200
+
+    def test_unknown_agent_returns_400(self) -> None:
+        app = _build_app()
+        with (
+            patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
+            TestClient(app) as client,
+        ):
+            response = client.post("/v1/chat", json={"message": "hi", "agent": "nope"})
+        assert response.status_code == 400
+        assert "Unknown agent" in response.json()["detail"]
+
+
 class TestChatEndpoint:
     def test_returns_200_on_success(self) -> None:
         app = _build_app()
         with (
             patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
             patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
-            patch("ai_service.api.chat.build_all_tools", return_value=[]),
             TestClient(app) as client,
         ):
             mock_graph = MagicMock()
@@ -120,7 +160,6 @@ class TestChatEndpoint:
         with (
             patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
             patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
-            patch("ai_service.api.chat.build_all_tools", return_value=[]),
             TestClient(app) as client,
         ):
             mock_graph = MagicMock()
@@ -142,7 +181,6 @@ class TestChatEndpoint:
         with (
             patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
             patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
-            patch("ai_service.api.chat.build_all_tools", return_value=[]),
             TestClient(app) as client,
         ):
             mock_graph = MagicMock()
@@ -166,7 +204,6 @@ class TestChatEndpoint:
         with (
             patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
             patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
-            patch("ai_service.api.chat.build_all_tools", return_value=[]),
             TestClient(app) as client,
         ):
             mock_graph = MagicMock()
@@ -191,7 +228,6 @@ class TestChatEndpoint:
         with (
             patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
             patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
-            patch("ai_service.api.chat.build_all_tools", return_value=[]),
             TestClient(app) as client,
         ):
             mock_graph = MagicMock()
@@ -224,7 +260,6 @@ class TestChatEndpoint:
                 return_value=_configured_settings_mock(app_env="development"),
             ),
             patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
-            patch("ai_service.api.chat.build_all_tools", return_value=[]),
             TestClient(app) as client,
         ):
             mock_graph = MagicMock()
@@ -254,7 +289,6 @@ class TestChatEndpoint:
                 return_value=_configured_settings_mock(app_env="production"),
             ),
             patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
-            patch("ai_service.api.chat.build_all_tools", return_value=[]),
             TestClient(app) as client,
         ):
             mock_graph = MagicMock()
@@ -283,7 +317,6 @@ class TestChatEndpoint:
                 return_value=_configured_settings_mock(),
             ),
             patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
-            patch("ai_service.api.chat.build_all_tools", return_value=[]),
             TestClient(app) as client,
         ):
             mock_graph = MagicMock()

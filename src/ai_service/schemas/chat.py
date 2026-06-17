@@ -21,6 +21,11 @@ class ChatRequest(BaseModel):
         default=None,
         description="Optional project scope. If set, the agent prefers this project.",
     )
+    agent: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Which agent to run. Defaults to the general-purpose PM agent.",
+    )
 
 
 class ToolCallRecord(BaseModel):

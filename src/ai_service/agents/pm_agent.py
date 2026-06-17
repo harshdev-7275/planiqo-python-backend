@@ -11,7 +11,7 @@ LLM providers supported:
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -22,6 +22,9 @@ from typing_extensions import TypedDict
 
 from ai_service.agents.prompts import PM_PERSONA_PROMPT
 from ai_service.config import Settings, get_settings
+
+if TYPE_CHECKING:
+    from ai_service.agents.base import AgentSpec
 
 # Max model<->tool loops before LangGraph aborts. The default (25) is easily
 # hit when a tool returns nothing and the model keeps probing other tools
@@ -99,15 +102,27 @@ def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
     return "__end__"
 
 
-def call_model(state: AgentState, llm_with_tools: BaseChatModel) -> dict[str, Any]:
-    """Run the LLM. Returns the new message(s) to merge into state."""
-    system = SystemMessage(content=PM_PERSONA_PROMPT)
+def call_model(
+    state: AgentState,
+    llm_with_tools: BaseChatModel,
+    prompt: str = PM_PERSONA_PROMPT,
+) -> dict[str, Any]:
+    """Run the LLM. Returns the new message(s) to merge into state.
+
+    `prompt` is the agent's system persona — supplied by the agent's
+    `AgentSpec` so the same loop serves any agent.
+    """
+    system = SystemMessage(content=prompt)
     response = llm_with_tools.invoke([system, *state["messages"]])
     return {"messages": [response]}
 
 
-def build_graph(tools: list[Any], settings: Settings) -> Any:
+def build_graph(tools: list[Any], settings: Settings, *, prompt: str = PM_PERSONA_PROMPT) -> Any:
     """Compile a LangGraph StateGraph that loops between model and tools.
+
+    `prompt` is the agent persona injected on every model call. Defaults to the
+    PM persona so the function is usable standalone, but the registry passes
+    each agent's own prompt.
 
     Returns a compiled graph with `.ainvoke(state)` for async execution.
     """
@@ -116,7 +131,7 @@ def build_graph(tools: list[Any], settings: Settings) -> Any:
     llm_with_tools = cast("BaseChatModel", llm.bind_tools(tools))
 
     def _call(state: AgentState) -> dict[str, Any]:
-        return call_model(state, llm_with_tools)
+        return call_model(state, llm_with_tools, prompt)
 
     workflow = StateGraph(AgentState)
     workflow.add_node("agent", _call)
@@ -186,16 +201,36 @@ async def arun_agent(
 _graph_cache: dict[Any, Any] = {}
 
 
-def get_or_build_graph(tools: list[Any], settings: Settings | None = None) -> Any:
-    """Get the cached graph or build one. Keyed by tool id to avoid stale tools."""
+def get_or_build_graph(
+    tools: list[Any],
+    settings: Settings | None = None,
+    *,
+    spec: AgentSpec | None = None,
+) -> Any:
+    """Get the cached graph or build one for the given agent.
+
+    Keyed by provider, model, agent name, and tool identity so different
+    agents (and stale tool lists) never collide in the cache.
+
+    `spec` selects the agent's prompt and (optionally) a custom graph topology.
+    Defaults to the PM agent so existing callers keep working.
+    """
     settings = settings or get_settings()
+    if spec is None:
+        from ai_service.agents.registry import get_agent_spec
+
+        spec = get_agent_spec()
     key: tuple[Any, ...] = (
         settings.llm_provider,
         settings.groq_model if settings.llm_provider == "groq" else settings.minimax_model,
+        spec.name,
         id(tuple(tools)),
     )
     if key not in _graph_cache:
-        _graph_cache[key] = build_graph(tools, settings)
+        if spec.graph_factory is not None:
+            _graph_cache[key] = spec.graph_factory(tools, settings, prompt=spec.prompt)
+        else:
+            _graph_cache[key] = build_graph(tools, settings, prompt=spec.prompt)
     return _graph_cache[key]
 
 
