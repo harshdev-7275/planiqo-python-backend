@@ -28,7 +28,7 @@ PM_SPEC = AgentSpec(
     name=DEFAULT_AGENT,
     prompt=PM_PERSONA_PROMPT,
     select_tools=build_all_tools,
-    description="General-purpose project-management assistant.",
+    description="Planiqo Assistant — general-purpose project-management assistant.",
 )
 
 

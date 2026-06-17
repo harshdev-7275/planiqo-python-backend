@@ -1,6 +1,6 @@
 """Pydantic schemas — request and response models."""
 
-from ai_service.schemas.chat import ChatRequest, ChatResponse, ToolCallRecord
+from ai_service.schemas.chat import ChatRequest, ChatResponse, ChatTurn, ToolCallRecord
 from ai_service.schemas.graph import (
     GraphProjectSyncRequest,
     GraphStatsResponse,
@@ -16,6 +16,7 @@ from ai_service.schemas.health import (
 __all__ = [
     "ChatRequest",
     "ChatResponse",
+    "ChatTurn",
     "GraphProjectSyncRequest",
     "GraphStatsResponse",
     "GraphSyncRequest",

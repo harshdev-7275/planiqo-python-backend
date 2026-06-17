@@ -16,7 +16,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
 
 from ai_service.agents import AgentDeps, get_or_build_graph
@@ -24,8 +24,11 @@ from ai_service.agents.registry import get_agent_spec
 from ai_service.config import get_settings
 from ai_service.core.errors import ConfigurationError
 from ai_service.logging import get_logger
-from ai_service.schemas import ChatRequest, ChatResponse, ToolCallRecord
+from ai_service.schemas import ChatRequest, ChatResponse, ChatTurn, ToolCallRecord
 
+# Cap how many prior turns we replay into the agent. The client may send up to
+# 50 (schema limit); we keep the most recent ones to bound prompt size and cost.
+_MAX_HISTORY_TURNS = 20
 # Width of the dev-mode console block (chars between the border rules).
 _DEV_LOG_WIDTH = 72
 # Tool result previews in the dev log are clipped so one huge payload can't
@@ -127,9 +130,11 @@ async def chat(
 
     # Scope to the requested project if provided.
     project_id_str: str | None = None
+    project_label: str | None = None
     if body.project_id is not None:
         deps.project_id = body.project_id
         project_id_str = str(body.project_id)
+        project_label = await _resolve_project_label(deps, body.project_id)
 
     # Build tools per-request (they capture org_slug from deps). The agent's
     # spec decides which tools it gets. Graph tools are included when Neo4j is
@@ -150,8 +155,12 @@ async def chat(
         + (settings.groq_model if settings.llm_provider == "groq" else settings.minimax_model)
     )
 
+    history = _history_to_messages(body.history)
+
     try:
-        result: dict[str, Any] = await _invoke_async(graph, body.message, deps, project_id_str)
+        result: dict[str, Any] = await _invoke_async(
+            graph, body.message, deps, project_id_str, project_label, history
+        )
     except ConfigurationError as exc:
         logger.exception("chat.config_error")
         raise HTTPException(
@@ -229,11 +238,48 @@ async def chat(
     )
 
 
+def _history_to_messages(history: list[ChatTurn]) -> list[BaseMessage]:
+    """Map the caller-supplied turns to LangChain messages (most recent kept).
+
+    Truncated to the last `_MAX_HISTORY_TURNS` so a long client history can't
+    blow up the prompt.
+    """
+    recent = history[-_MAX_HISTORY_TURNS:]
+    messages: list[BaseMessage] = []
+    for turn in recent:
+        if turn.role == "user":
+            messages.append(HumanMessage(content=turn.content))
+        else:
+            messages.append(AIMessage(content=turn.content))
+    return messages
+
+
+async def _resolve_project_label(deps: AgentDeps, project_id: UUID) -> str:
+    """Look up a readable label ("Name (KEY)") for the scoped project.
+
+    Resolved server-side from node-backend so the model sees the real project
+    name, not a UUID. Falls back to the bare id if the lookup fails or the
+    project can't be found — scoping still works either way.
+    """
+    try:
+        project = await deps.node_backend.get_project(deps.org_slug, project_id)
+    except Exception:  # noqa: BLE001 — scoping must not fail the chat; fall back to the id
+        logger.warning("chat.project_lookup_failed", extra={"project_id": str(project_id)})
+        project = None
+    if not project:
+        return str(project_id)
+    name = project.get("name") or str(project_id)
+    key = project.get("key")
+    return f"{name} ({key})" if key else str(name)
+
+
 async def _invoke_async(
     graph: Any,
     message: str,
     deps: AgentDeps,
     project_id_str: str | None,
+    project_label: str | None = None,
+    history: list[BaseMessage] | None = None,
 ) -> dict[str, Any]:
     from ai_service.agents.pm_agent import arun_agent
 
@@ -244,6 +290,8 @@ async def _invoke_async(
         org_slug=deps.org_slug,
         user_id=str(deps.user_id),
         project_id=project_id_str,
+        project_label=project_label,
+        history=history,
     )
 
 

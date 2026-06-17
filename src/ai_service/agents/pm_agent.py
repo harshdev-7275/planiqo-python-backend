@@ -45,6 +45,10 @@ class AgentState(TypedDict, total=False):
     org_id: str
     org_slug: str
     project_id: str | None
+    # Human-readable label of the scoped project (e.g. "New Project (NP)"),
+    # injected into the system prompt so the model knows the active scope. None
+    # when the conversation is not scoped to a single project.
+    project_label: str | None
     user_id: str
 
 
@@ -111,8 +115,22 @@ def call_model(
 
     `prompt` is the agent's system persona — supplied by the agent's
     `AgentSpec` so the same loop serves any agent.
+
+    When the run is scoped to a single project (`project_label` is set in
+    state), a scope notice is appended so the model knows which project it is
+    working in and does not ask the user for a project id it already has.
     """
-    system = SystemMessage(content=prompt)
+    content = prompt
+    label = state.get("project_label")
+    if label:
+        content += (
+            "\n\n## Current scope\n"
+            f"This conversation is scoped to the project {label}. Every tool is "
+            "already restricted to this project, so never ask the user for a "
+            "project id or project name — assume all questions are about this "
+            "project, and do not reference or compare against any other project."
+        )
+    system = SystemMessage(content=content)
     response = llm_with_tools.invoke([system, *state["messages"]])
     return {"messages": [response]}
 
@@ -146,6 +164,13 @@ def build_graph(tools: list[Any], settings: Settings, *, prompt: str = PM_PERSON
     return workflow.compile()
 
 
+def _seed_messages(
+    message: str, history: list[BaseMessage] | None
+) -> list[BaseMessage]:
+    """Prior turns (oldest first) followed by the new user message."""
+    return [*(history or []), HumanMessage(content=message)]
+
+
 def run_agent(
     graph: Any,
     message: str,
@@ -154,17 +179,27 @@ def run_agent(
     org_slug: str,
     user_id: str,
     project_id: str | None = None,
+    project_label: str | None = None,
+    history: list[BaseMessage] | None = None,
 ) -> dict[str, Any]:
     """Invoke the agent graph and return the final state.
+
+    `history` is the prior conversation (already converted to LangChain
+    messages, oldest first). It seeds the run so the agent has multi-turn
+    context — the endpoint itself stays stateless.
+
+    `project_label` is the human-readable name of the scoped project; when set
+    it is surfaced to the model via the system prompt.
 
     Returns the full state dict so callers can extract the final message,
     tool calls, and any other state they care about.
     """
     state: AgentState = {
-        "messages": [HumanMessage(content=message)],
+        "messages": _seed_messages(message, history),
         "org_id": org_id,
         "org_slug": org_slug,
         "project_id": project_id,
+        "project_label": project_label,
         "user_id": user_id,
     }
     return cast(
@@ -181,13 +216,16 @@ async def arun_agent(
     org_slug: str,
     user_id: str,
     project_id: str | None = None,
+    project_label: str | None = None,
+    history: list[BaseMessage] | None = None,
 ) -> dict[str, Any]:
     """Async version of run_agent."""
     state: AgentState = {
-        "messages": [HumanMessage(content=message)],
+        "messages": _seed_messages(message, history),
         "org_id": org_id,
         "org_slug": org_slug,
         "project_id": project_id,
+        "project_label": project_label,
         "user_id": user_id,
     }
     return cast(

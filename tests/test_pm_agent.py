@@ -12,6 +12,7 @@ from ai_service.agents.pm_agent import (
     AgentState,
     build_graph,
     build_llm,
+    call_model,
     get_or_build_graph,
     should_continue,
 )
@@ -92,6 +93,33 @@ class TestShouldContinue:
             "messages": [HumanMessage(content="hi"), AIMessage(content="Done.")],
         }
         assert should_continue(state) == "__end__"
+
+
+class TestCallModel:
+    def _capture_system(self, state: AgentState) -> str:
+        captured: dict[str, str] = {}
+        mock_llm = MagicMock()
+
+        def _invoke(messages: list[Any]) -> Any:
+            captured["system"] = messages[0].content
+            return MagicMock(tool_calls=[])
+
+        mock_llm.invoke.side_effect = _invoke
+        call_model(state, mock_llm)
+        return captured["system"]
+
+    def test_injects_scope_when_project_label_present(self) -> None:
+        system = self._capture_system(
+            {"messages": [HumanMessage(content="list open issues")], "project_label": "New Project (NP)"}
+        )
+        assert "New Project (NP)" in system
+        assert "scoped" in system.lower()
+        # The model is told not to ask for a project id it already has.
+        assert "project id" in system.lower()
+
+    def test_no_scope_section_without_label(self) -> None:
+        system = self._capture_system({"messages": [HumanMessage(content="hi")]})
+        assert "Current scope" not in system
 
 
 class TestBuildGraph:

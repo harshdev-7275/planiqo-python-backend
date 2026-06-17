@@ -196,6 +196,106 @@ class TestChatEndpoint:
         # A recursion_limit is always passed so the loop is bounded.
         assert captured["config"]["recursion_limit"] > 0
 
+    def test_injects_resolved_project_label_into_state(self) -> None:
+        """When scoped, the endpoint resolves the project name and seeds it in state."""
+        nb = MagicMock()
+        nb.get_project = AsyncMock(return_value={"name": "New Project", "key": "NP"})
+        app = _build_app(node_backend=nb)
+        captured: dict[str, Any] = {}
+
+        async def fake_ainvoke(state: dict[str, Any], *args: Any, **kwargs: Any) -> dict[str, Any]:
+            captured["state"] = state
+            return _fake_graph_result("ok")
+
+        with (
+            patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
+            patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
+            TestClient(app) as client,
+        ):
+            mock_graph = MagicMock()
+            mock_graph.ainvoke = fake_ainvoke
+            mock_graph_factory.return_value = mock_graph
+            response = client.post(
+                "/v1/chat",
+                json={
+                    "message": "list open issues",
+                    "project_id": "7b6f4200-249a-446c-a039-6d711d4a02e4",
+                },
+            )
+        assert response.status_code == 200
+        nb.get_project.assert_awaited_once()
+        assert captured["state"]["project_label"] == "New Project (NP)"
+
+    def test_no_project_label_when_unscoped(self) -> None:
+        app = _build_app()
+        captured: dict[str, Any] = {}
+
+        async def fake_ainvoke(state: dict[str, Any], *args: Any, **kwargs: Any) -> dict[str, Any]:
+            captured["state"] = state
+            return _fake_graph_result("ok")
+
+        with (
+            patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
+            patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
+            TestClient(app) as client,
+        ):
+            mock_graph = MagicMock()
+            mock_graph.ainvoke = fake_ainvoke
+            mock_graph_factory.return_value = mock_graph
+            response = client.post("/v1/chat", json={"message": "hi"})
+        assert response.status_code == 200
+        assert captured["state"]["project_label"] is None
+
+    def test_replays_history_into_agent_state(self) -> None:
+        """Prior turns sent by the client must seed the agent's message list."""
+        app = _build_app()
+        captured: dict[str, Any] = {}
+
+        async def fake_ainvoke(state: dict[str, Any], *args: Any, **kwargs: Any) -> dict[str, Any]:
+            captured["state"] = state
+            return _fake_graph_result("ok")
+
+        with (
+            patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
+            patch("ai_service.api.chat.get_or_build_graph") as mock_graph_factory,
+            TestClient(app) as client,
+        ):
+            mock_graph = MagicMock()
+            mock_graph.ainvoke = fake_ainvoke
+            mock_graph_factory.return_value = mock_graph
+            response = client.post(
+                "/v1/chat",
+                json={
+                    "message": "From TP",
+                    "history": [
+                        {"role": "user", "content": "give me all issues"},
+                        {"role": "assistant", "content": "Which project? TP or NP"},
+                    ],
+                },
+            )
+        assert response.status_code == 200
+        msgs = captured["state"]["messages"]
+        # 2 history turns + the new user message, in order.
+        assert len(msgs) == 3
+        assert isinstance(msgs[0], HumanMessage)
+        assert msgs[0].content == "give me all issues"
+        assert isinstance(msgs[1], AIMessage)
+        assert msgs[1].content == "Which project? TP or NP"
+        assert isinstance(msgs[2], HumanMessage)
+        assert msgs[2].content == "From TP"
+
+    def test_rejects_invalid_history_role(self) -> None:
+        app = _build_app()
+        with (
+            patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
+            TestClient(app) as client,
+        ):
+            response = client.post(
+                "/v1/chat",
+                json={"message": "hi", "history": [{"role": "system", "content": "x"}]},
+            )
+        assert response.status_code == 422
+
     def test_returns_graceful_message_on_recursion_limit(self) -> None:
         """A GraphRecursionError must yield a friendly 200, not a 502."""
         from langgraph.errors import GraphRecursionError
