@@ -30,7 +30,7 @@ class TestToolLoggingCallbackHandler:
         start = next(r for r in caplog.records if r.getMessage() == "tool.start")
         end = next(r for r in caplog.records if r.getMessage() == "tool.end")
         assert start.tool == "graph_suggest_assignee"  # type: ignore[attr-defined]
-        assert "issue_id" in start.args  # type: ignore[attr-defined]
+        assert "issue_id" in start.tool_args  # type: ignore[attr-defined]
         assert end.tool == "graph_suggest_assignee"  # type: ignore[attr-defined]
         assert isinstance(end.duration_ms, float)  # type: ignore[attr-defined]
         assert end.result_chars > 0  # type: ignore[attr-defined]
@@ -45,7 +45,7 @@ class TestToolLoggingCallbackHandler:
         err = next(r for r in caplog.records if r.getMessage() == "tool.error")
         assert err.tool == "list_issues"  # type: ignore[attr-defined]
         assert err.error == "ValueError"  # type: ignore[attr-defined]
-        assert "bad limit" in err.message  # type: ignore[attr-defined]
+        assert "bad limit" in err.error_message  # type: ignore[attr-defined]
 
     def test_logs_model_round_trip(self, caplog: pytest.LogCaptureFixture) -> None:
         from langchain_core.messages import HumanMessage, SystemMessage

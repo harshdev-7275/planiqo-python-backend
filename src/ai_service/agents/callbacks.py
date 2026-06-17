@@ -59,7 +59,7 @@ class ToolLoggingCallbackHandler(AsyncCallbackHandler):
         self._runs[run_id] = (time.perf_counter(), name)
         logger.info(
             "tool.start",
-            extra={"tool": name, "args": _clip(inputs if inputs is not None else input_str)},
+            extra={"tool": name, "tool_args": _clip(inputs if inputs is not None else input_str)},
         )
 
     async def on_tool_end(self, output: Any, *, run_id: UUID, **kwargs: Any) -> None:
@@ -79,7 +79,7 @@ class ToolLoggingCallbackHandler(AsyncCallbackHandler):
                 "tool": name,
                 "duration_ms": duration_ms,
                 "error": type(error).__name__,
-                "message": _clip(error),
+                "error_message": _clip(error),
             },
         )
 
