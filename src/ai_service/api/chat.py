@@ -11,9 +11,7 @@ the structured JSON logs so log pipelines can ingest them.
 
 from __future__ import annotations
 
-import base64
-import binascii
-import json
+import hmac
 from typing import Any
 from uuid import UUID
 
@@ -34,17 +32,6 @@ _DEV_LOG_WIDTH = 72
 _TOOL_RESULT_PREVIEW_CHARS = 200
 
 
-def _decode_jwt_payload(token: str) -> dict[str, Any]:
-    """Base64-decode a JWT payload section without signature verification."""
-    try:
-        part = token.split(".")[1]
-        padding = 4 - len(part) % 4
-        if padding != 4:
-            part += "=" * padding
-        return json.loads(base64.urlsafe_b64decode(part))  # type: ignore[no-any-return]
-    except (IndexError, ValueError, json.JSONDecodeError, binascii.Error):
-        return {}
-
 logger = get_logger(__name__)
 router = APIRouter(prefix="/v1", tags=["chat"])
 
@@ -53,12 +40,15 @@ _FALLBACK_UUID = "00000000-0000-0000-0000-000000000000"
 
 
 def get_agent_deps(request: Request) -> AgentDeps:
-    """Build AgentDeps from the incoming request JWT.
+    """Build AgentDeps from the trusted service-to-service request.
 
-    The frontend sends the user's JWT in Authorization: Bearer <token>.
-    That JWT now contains orgId + orgSlug (embedded at login by node-backend).
-    We decode it here (no signature verification — ai-service trusts its own
-    frontend; auth enforcement happens inside node-backend via AI_SERVICE_TOKEN).
+    ai-service is a PRIVATE service. Its only caller is node-backend (the BFF),
+    which authenticates with a static shared secret in ``X-Service-Token`` and
+    passes the *already-verified* caller identity in trusted headers:
+    ``X-Org-Id``, ``X-Org-Slug``, ``X-User-Id``. ai-service never sees, nor
+    trusts, the end user's JWT — node-backend has already verified it.
+
+    When no service token is configured (local dev), the token check is skipped.
     """
     client = getattr(request.app.state, "node_backend", None)
     if client is None:
@@ -70,14 +60,20 @@ def get_agent_deps(request: Request) -> AgentDeps:
             ),
         )
 
-    # Decode the user JWT from the Authorization header.
-    auth_header = request.headers.get("authorization", "")
-    token = auth_header.removeprefix("Bearer ").strip()
-    payload = _decode_jwt_payload(token) if token else {}
+    # --- Service-token auth (enforced whenever a token is configured) ---
+    expected_token = getattr(request.app.state, "service_token", "") or ""
+    if expected_token:
+        presented = request.headers.get("x-service-token", "")
+        if not hmac.compare_digest(presented, expected_token):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing service token.",
+            )
 
-    org_slug   = payload.get("orgSlug")   or getattr(request.app.state, "service_org_slug", "") or "unknown"
-    org_id_str = payload.get("orgId")     or getattr(request.app.state, "service_org_id", "")  or _FALLBACK_UUID
-    user_id_str = payload.get("userId")   or getattr(request.app.state, "service_user_id", "") or _FALLBACK_UUID
+    # --- Trusted identity headers (set by node-backend from the verified JWT) ---
+    org_slug    = request.headers.get("x-org-slug")  or getattr(request.app.state, "service_org_slug", "") or "unknown"
+    org_id_str  = request.headers.get("x-org-id")    or getattr(request.app.state, "service_org_id", "")  or _FALLBACK_UUID
+    user_id_str = request.headers.get("x-user-id")   or getattr(request.app.state, "service_user_id", "") or _FALLBACK_UUID
 
     try:
         org_id  = UUID(org_id_str)

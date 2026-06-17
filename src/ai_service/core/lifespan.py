@@ -71,6 +71,10 @@ async def lifespan(app: FastAPI, settings: Settings) -> AsyncIterator[None]:
         )
     app.state.node_backend = node_backend
 
+    # Shared secret the BFF (node-backend) must present on inbound requests.
+    # When empty (local dev), service-token auth is disabled — see chat.get_agent_deps.
+    app.state.service_token = settings.node_backend_service_token
+
     # --- Neo4j (optional) ---
     neo4j_client: Neo4jClient | None = None
     if settings.neo4j_configured:

@@ -294,30 +294,74 @@ class TestChatEndpoint:
         assert body["tool_calls"][0]["result_preview"] == "hello world"
 
 
-class TestGetAgentDeps:
-    def test_builds_deps_from_app_state(self) -> None:
-        import base64
-        import json
+def _request_with_headers(app: FastAPI, headers: dict[str, str]) -> Any:
+    """A MagicMock request whose .headers.get reads from a real dict (lowercased)."""
+    lowered = {k.lower(): v for k, v in headers.items()}
+    request = MagicMock(app=app)
+    request.headers.get.side_effect = lambda key, default="": lowered.get(key.lower(), default)
+    return request
 
+
+class TestGetAgentDeps:
+    def test_builds_deps_from_trusted_identity_headers(self) -> None:
         client = MagicMock()
         app = _build_app(node_backend=client)
-        # Simulate lifespan-resolved org (app.state has service_org_slug set).
-        app.state.service_org_slug = "test-org"
-        app.state.service_org_id = "00000000-0000-0000-0000-000000000001"
-        app.state.service_user_id = "00000000-0000-0000-0000-000000000002"
-        # Build a real-shaped JWT (header.payload.signature) so base64 decode
-        # succeeds and the org context in the payload is picked up.
-        payload = {
-            "orgId": "00000000-0000-0000-0000-000000000099",
-            "orgSlug": "from-jwt",
-            "userId": "00000000-0000-0000-0000-000000000098",
-        }
-        encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
-        token = f"hdr.{encoded}.sig"
-        request = MagicMock(app=app)
-        request.headers.get.return_value = f"Bearer {token}"
+        app.state.service_token = ""  # token auth disabled
+        request = _request_with_headers(
+            app,
+            {
+                "X-Org-Id": "00000000-0000-0000-0000-000000000099",
+                "X-Org-Slug": "from-headers",
+                "X-User-Id": "00000000-0000-0000-0000-000000000098",
+            },
+        )
         deps = get_agent_deps(request)
         assert deps.node_backend is client
-        assert deps.org_slug == "from-jwt"
-        assert deps.org_id is not None
-        assert deps.user_id is not None
+        assert deps.org_slug == "from-headers"
+        assert str(deps.org_id) == "00000000-0000-0000-0000-000000000099"
+        assert str(deps.user_id) == "00000000-0000-0000-0000-000000000098"
+
+    def test_accepts_matching_service_token(self) -> None:
+        app = _build_app()
+        app.state.service_token = "s" * 32
+        request = _request_with_headers(
+            app,
+            {
+                "X-Service-Token": "s" * 32,
+                "X-Org-Id": "00000000-0000-0000-0000-000000000099",
+                "X-Org-Slug": "acme",
+                "X-User-Id": "00000000-0000-0000-0000-000000000098",
+            },
+        )
+        deps = get_agent_deps(request)
+        assert deps.org_slug == "acme"
+
+    def test_rejects_missing_service_token(self) -> None:
+        from fastapi import HTTPException
+
+        app = _build_app()
+        app.state.service_token = "s" * 32
+        request = _request_with_headers(app, {"X-Org-Slug": "acme"})
+        with pytest.raises(HTTPException) as exc:
+            get_agent_deps(request)
+        assert exc.value.status_code == 401
+
+    def test_rejects_wrong_service_token(self) -> None:
+        from fastapi import HTTPException
+
+        app = _build_app()
+        app.state.service_token = "s" * 32
+        request = _request_with_headers(app, {"X-Service-Token": "wrong-token"})
+        with pytest.raises(HTTPException) as exc:
+            get_agent_deps(request)
+        assert exc.value.status_code == 401
+
+    def test_503_when_node_backend_missing(self) -> None:
+        from fastapi import HTTPException
+
+        app = FastAPI()
+        app.state.node_backend = None
+        request = _request_with_headers(app, {})
+        with pytest.raises(HTTPException) as exc:
+            get_agent_deps(request)
+        assert exc.value.status_code == 503
