@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, ToolCall
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolCall
 
 from ai_service.agents.pm_agent import (
     AgentState,
+    astream_agent,
     build_graph,
     build_llm,
     call_model,
@@ -148,3 +150,153 @@ class TestGetOrBuildGraph:
         assert g1 is g2
         # Same tools + same settings → only one build.
         assert mock_build.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Streaming — astream_agent
+# ---------------------------------------------------------------------------
+
+_MODEL = "groq:llama-3.3-70b-versatile"
+
+
+def _event(kind: str, **payload: Any) -> dict[str, Any]:
+    """Build a LangGraph astream_events event dict (version='v2' shape)."""
+    return {"event": kind, "name": "agent", **payload}
+
+
+class TestAstreamAgent:
+    async def test_yields_token_events_for_model_deltas(self) -> None:
+        """on_chat_model_stream chunks become {type: 'token', delta: ...} events."""
+        graph = MagicMock()
+
+        async def fake_astream_events(
+            *args: Any, **kwargs: Any
+        ) -> AsyncIterator[dict[str, Any]]:
+            yield _event(
+                "on_chat_model_stream",
+                data={"chunk": AIMessageChunk(content="Hello")},
+            )
+            yield _event(
+                "on_chat_model_stream",
+                data={"chunk": AIMessageChunk(content=" world")},
+            )
+
+        graph.astream_events = fake_astream_events
+
+        events: list[dict[str, Any]] = []
+        async for ev in astream_agent(
+            graph,
+            "hi",
+            org_id="00000000-0000-0000-0000-000000000001",
+            org_slug="acme",
+            user_id="00000000-0000-0000-0000-000000000002",
+            model=_MODEL,
+        ):
+            events.append(ev)
+
+        tokens = [e for e in events if e.get("type") == "token"]
+        assert [e["delta"] for e in tokens] == ["Hello", " world"]
+
+    async def test_yields_tool_start_and_end_events_with_matching_ids(self) -> None:
+        """on_tool_start → tool_start, on_tool_end → tool_end, same tool_call_id."""
+        graph = MagicMock()
+
+        async def fake_astream_events(
+            *args: Any, **kwargs: Any
+        ) -> AsyncIterator[dict[str, Any]]:
+            yield _event(
+                "on_tool_start",
+                name="list_issues",
+                run_id="t1",
+                data={"input": {"project_id": "p1"}},
+            )
+            yield _event(
+                "on_tool_end",
+                name="list_issues",
+                run_id="t1",
+                data={"output": "result text"},
+            )
+
+        graph.astream_events = fake_astream_events
+
+        events: list[dict[str, Any]] = []
+        async for ev in astream_agent(
+            graph,
+            "hi",
+            org_id="00000000-0000-0000-0000-000000000001",
+            org_slug="acme",
+            user_id="00000000-0000-0000-0000-000000000002",
+            model=_MODEL,
+        ):
+            events.append(ev)
+
+        starts = [e for e in events if e.get("type") == "tool_start"]
+        ends = [e for e in events if e.get("type") == "tool_end"]
+        assert len(starts) == 1
+        assert starts[0]["tool"] == "list_issues"
+        assert starts[0]["args"] == {"project_id": "p1"}
+        assert len(ends) == 1
+        assert ends[0]["result_preview"] == "result text"
+        # Caller uses tool_call_id to pair start/end UI chips.
+        assert starts[0]["tool_call_id"] == ends[0]["tool_call_id"]
+
+    async def test_yields_done_event_with_accumulated_message(self) -> None:
+        """The 'done' event carries the concatenated streamed content + the model."""
+        graph = MagicMock()
+
+        async def fake_astream_events(
+            *args: Any, **kwargs: Any
+        ) -> AsyncIterator[dict[str, Any]]:
+            yield _event(
+                "on_chat_model_stream",
+                data={"chunk": AIMessageChunk(content="Hello")},
+            )
+            yield _event(
+                "on_chat_model_stream",
+                data={"chunk": AIMessageChunk(content=" world")},
+            )
+
+        graph.astream_events = fake_astream_events
+
+        events: list[dict[str, Any]] = []
+        async for ev in astream_agent(
+            graph,
+            "hi",
+            org_id="00000000-0000-0000-0000-000000000001",
+            org_slug="acme",
+            user_id="00000000-0000-0000-0000-000000000002",
+            model=_MODEL,
+        ):
+            events.append(ev)
+
+        done = [e for e in events if e.get("type") == "done"]
+        assert len(done) == 1
+        assert done[0]["message"] == "Hello world"
+        assert done[0]["model"] == _MODEL
+        assert "steps" in done[0]
+
+    async def test_passes_recursion_limit_to_graph(self) -> None:
+        """Bounded recursion — same limit as the non-streaming run_agent."""
+        graph = MagicMock()
+        captured: dict[str, Any] = {}
+
+        async def fake_astream_events(
+            *args: Any, **kwargs: Any
+        ) -> AsyncIterator[dict[str, Any]]:
+            captured.update(kwargs.get("config", {}))
+            if False:  # pragma: no cover — keep this an async generator
+                yield {}
+
+        graph.astream_events = fake_astream_events
+
+        async for _ in astream_agent(
+            graph,
+            "hi",
+            org_id="00000000-0000-0000-0000-000000000001",
+            org_slug="acme",
+            user_id="00000000-0000-0000-0000-000000000002",
+            model=_MODEL,
+        ):
+            pass
+
+        assert captured.get("recursion_limit") == 40
