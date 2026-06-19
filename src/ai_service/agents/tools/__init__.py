@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from ai_service.agents.tools.categories import make_category_tools
 from ai_service.agents.tools.issues import make_issue_tools
 from ai_service.agents.tools.projects import make_project_tools
+from ai_service.agents.tools.sprints import make_sprint_tools
 from ai_service.agents.tools.users import make_user_tools
 from ai_service.clients.node_backend import NodeBackendClient
 
@@ -38,6 +40,8 @@ def build_all_tools(
     tools: list[Any] = [
         *make_issue_tools(client, org_slug, scoped_project_id=scoped_project_id),
         *make_project_tools(client, org_slug, scoped_project_id=scoped_project_id),
+        *make_category_tools(client, org_slug, scoped_project_id=scoped_project_id),
+        *make_sprint_tools(client, org_slug, scoped_project_id=scoped_project_id),
         *make_user_tools(client, org_slug),
     ]
     if neo4j_client is not None and org_id:

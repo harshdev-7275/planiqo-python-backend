@@ -7,9 +7,8 @@ how long they took, and whether they failed. Every line inherits the request's
 ``request_id`` (set by the request-logging middleware), so all the steps of one
 chat turn share a correlation id.
 
-Tool *arguments* are logged (clipped) because they are operational identifiers
-(project/issue ids, keywords) and are what you need for debugging; tool *results*
-are logged only as a size, never their content.
+Tool arguments and a result preview are logged so that debugging scoping and
+data-flow issues requires nothing beyond the server console.
 """
 
 from __future__ import annotations
@@ -28,8 +27,8 @@ if TYPE_CHECKING:
 
 logger = get_logger("ai_service.agent")
 
-# Tool inputs/errors are clipped so one big payload can't flood the logs.
-_MAX_LOG_CHARS = 300
+_MAX_LOG_CHARS = 500
+_MAX_RESULT_PREVIEW = 500
 
 
 def _clip(value: Any, limit: int = _MAX_LOG_CHARS) -> str:
@@ -41,7 +40,6 @@ class ToolLoggingCallbackHandler(AsyncCallbackHandler):
     """Logs the agent's tool and model calls for debugging/observability."""
 
     def __init__(self) -> None:
-        # run_id -> (start time, label) so end/error logs can report latency + name.
         self._runs: dict[UUID, tuple[float, str]] = {}
 
     # --- tools ---------------------------------------------------------------
@@ -57,16 +55,22 @@ class ToolLoggingCallbackHandler(AsyncCallbackHandler):
     ) -> None:
         name = (serialized or {}).get("name") or kwargs.get("name") or "unknown"
         self._runs[run_id] = (time.perf_counter(), name)
+        args = inputs if inputs is not None else input_str
         logger.info(
             "tool.start",
-            extra={"tool": name, "tool_args": _clip(inputs if inputs is not None else input_str)},
+            extra={"tool": name, "tool_args": _clip(args, _MAX_LOG_CHARS)},
         )
 
     async def on_tool_end(self, output: Any, *, run_id: UUID, **kwargs: Any) -> None:
         duration_ms, name = self._finish(run_id)
         logger.info(
             "tool.end",
-            extra={"tool": name, "duration_ms": duration_ms, "result_chars": len(str(output))},
+            extra={
+                "tool": name,
+                "duration_ms": duration_ms,
+                "result_chars": len(str(output)),
+                "result_preview": _clip(output, _MAX_RESULT_PREVIEW),
+            },
         )
 
     async def on_tool_error(

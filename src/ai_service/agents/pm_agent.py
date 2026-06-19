@@ -257,11 +257,12 @@ def get_or_build_graph(
     settings: Settings | None = None,
     *,
     spec: AgentSpec | None = None,
+    scoped_project_id: str | None = None,
 ) -> Any:
     """Get the cached graph or build one for the given agent.
 
-    Keyed by provider, model, agent name, and tool identity so different
-    agents (and stale tool lists) never collide in the cache.
+    Keyed by provider, model, agent name, and scoped project so different
+    agents and project scopes never collide in the cache.
 
     `spec` selects the agent's prompt and (optionally) a custom graph topology.
     Defaults to the PM agent so existing callers keep working.
@@ -275,7 +276,7 @@ def get_or_build_graph(
         settings.llm_provider,
         settings.groq_model if settings.llm_provider == "groq" else settings.minimax_model,
         spec.name,
-        id(tuple(tools)),
+        scoped_project_id,
     )
     if key not in _graph_cache:
         if spec.graph_factory is not None:

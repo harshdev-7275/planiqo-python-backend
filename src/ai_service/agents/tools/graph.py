@@ -4,15 +4,52 @@ These tools are only included in the agent's tool list when Neo4j is
 configured (i.e., `app.state.neo4j` is not None). They provide relationship-
 aware answers that REST-based tools cannot: "who should own this?", "what
 else is in this sprint?", "show me the subtask tree".
+
+The ``graph_query`` escape-hatch lets the LLM run arbitrary read-only Cypher
+when no pre-built tool covers the question.
 """
 
 from __future__ import annotations
 
+import logging
+import re
 from typing import Any
 
 from langchain_core.tools import tool
 
 from ai_service.neo4j import Neo4jClient
+
+logger = logging.getLogger(__name__)
+
+_WRITE_PATTERN = re.compile(
+    r"\b(CREATE|MERGE|SET|DELETE|DETACH|REMOVE|DROP|CALL\s*\{)\b",
+    re.IGNORECASE,
+)
+
+_MAX_GRAPH_QUERY_ROWS = 50
+
+_GRAPH_SCHEMA_DESCRIPTION = """
+Node labels and their properties:
+  Org      — id, slug
+  Project  — id, name, orgId
+  Category — id, name, color, projectId
+  Sprint   — id, name, status, startDate, endDate, projectId
+  Issue    — id, number, title, description, type, priority, statusId, completedAt, createdAt
+  User     — id, name, email
+
+Relationships:
+  (Project)-[:BELONGS_TO]->(Org)
+  (Category)-[:IN_PROJECT]->(Project)
+  (Sprint)-[:IN_PROJECT]->(Project)
+  (Issue)-[:IN_CATEGORY]->(Category)
+  (Issue)-[:IN_SPRINT]->(Sprint)
+  (User)-[:ASSIGNED_TO]->(Issue)
+  (Issue)-[:SUBTASK_OF]->(Issue)
+  (User)-[:MEMBER_OF]->(Org)
+  (User)-[:RESOLVED {at}]->(Issue)
+  (User)-[:COMMENTED_ON {count, lastAt}]->(Issue)
+  (User)-[:CHANGED {count, lastAt}]->(Issue)
+""".strip()
 
 
 def make_graph_tools(
@@ -171,6 +208,45 @@ def make_graph_tools(
 
         return await get_subtask_tree(neo4j_client, issue_id)
 
+    _graph_query_description = (
+        "Run a read-only Cypher query against the knowledge graph.\n\n"
+        "Use this when none of the specialised graph tools (suggest_assignee, "
+        "similar_issues, related_issues, sprint_progress, user_workload, "
+        "user_activity, subtask_tree) can answer the user's question. This is "
+        "the escape-hatch for ad-hoc queries: category listings, counts, "
+        "aggregations, cross-entity joins, or any question not covered by the "
+        "other tools.\n\n"
+        "RULES:\n"
+        "- ONLY read queries (MATCH / OPTIONAL MATCH / WITH / RETURN / ORDER BY / "
+        "LIMIT / UNION). Never write (CREATE, MERGE, SET, DELETE, REMOVE, DROP).\n"
+        f"- Always add LIMIT (max {_MAX_GRAPH_QUERY_ROWS}) to avoid huge results.\n"
+        "- When scoping to the current project, filter via the project id that you "
+        "already know from context (do not ask the user for it).\n\n"
+        f"GRAPH SCHEMA:\n{_GRAPH_SCHEMA_DESCRIPTION}\n\n"
+        "Args:\n"
+        "    cypher: A read-only Cypher query string. Must contain RETURN. Must NOT "
+        "contain CREATE, MERGE, SET, DELETE, DETACH, REMOVE, or DROP.\n\n"
+        "Returns:\n"
+        f"    List of row dicts (max {_MAX_GRAPH_QUERY_ROWS} rows). Empty list if the "
+        "query returns nothing or is rejected."
+    )
+
+    @tool(description=_graph_query_description)
+    async def graph_query(cypher: str) -> list[dict[str, Any]]:
+        """Run a read-only Cypher query against the knowledge graph."""
+        if _WRITE_PATTERN.search(cypher):
+            logger.warning("graph_query.write_rejected", extra={"cypher": cypher[:200]})
+            return [{"error": "Write operations are not allowed. Use read-only Cypher only."}]
+
+        try:
+            async with neo4j_client.session() as sess:
+                result = await sess.run(cypher)
+                rows = [dict(r) for r in await result.data()]
+                return rows[:_MAX_GRAPH_QUERY_ROWS]
+        except Exception as exc:
+            logger.warning("graph_query.error", extra={"cypher": cypher[:200], "error": str(exc)})
+            return [{"error": f"Query failed: {exc}"}]
+
     return [
         graph_suggest_assignee,
         graph_similar_issues,
@@ -179,6 +255,7 @@ def make_graph_tools(
         graph_user_workload,
         graph_user_activity,
         graph_subtask_tree,
+        graph_query,
     ]
 
 

@@ -144,6 +144,20 @@ async def chat(
         project_id_str = str(body.project_id)
         project_label = await _resolve_project_label(deps, body.project_id)
 
+    logger.info(
+        "chat.request",
+        extra={
+            "agent": body.agent or "pm",
+            "message_chars": len(body.message),
+            "project_id": project_id_str,
+            "project_label": project_label,
+            "org_slug": deps.org_slug,
+            "org_id": str(deps.org_id),
+            "user_id": str(deps.user_id),
+            "history_turns": len(body.history),
+        },
+    )
+
     # Build tools per-request (they capture org_slug from deps). The agent's
     # spec decides which tools it gets. Graph tools are included when Neo4j is
     # configured on app.state.
@@ -155,7 +169,7 @@ async def chat(
         org_id=str(deps.org_id),
         scoped_project_id=project_id_str,
     )
-    graph = get_or_build_graph(tools, settings, spec=spec)
+    graph = get_or_build_graph(tools, settings, spec=spec, scoped_project_id=project_id_str)
 
     model_id = (
         settings.llm_provider
@@ -227,8 +241,6 @@ async def chat(
                     )
                 )
 
-    # One structured line per turn. No message content / answer text is logged
-    # (it is user data) — only operational metadata for monitoring and cost.
     logger.info(
         "chat.completed",
         extra={
@@ -242,6 +254,9 @@ async def chat(
             "history_turns": len(body.history),
         },
     )
+
+    if settings.app_env == "development":
+        _dev_summary(body.message, project_id_str, project_label, tool_calls, answer, model_id)
 
     return ChatResponse(
         message=answer,
@@ -341,6 +356,39 @@ def _content_to_text(content: Any) -> str:
                 parts.append(str(block))
         return "\n".join(parts)
     return str(content)
+
+
+def _dev_summary(
+    user_msg: str,
+    project_id: str | None,
+    project_label: str | None,
+    tool_calls: list[ToolCallRecord],
+    answer: str,
+    model_id: str,
+) -> None:
+    """Pretty-print a request summary to the console (development only)."""
+    import json
+    import sys
+
+    lines = [
+        "",
+        "=" * 72,
+        f"  USER: {user_msg[:120]}",
+        f"  SCOPE: project_id={project_id}  label={project_label}",
+        f"  MODEL: {model_id}",
+        "-" * 72,
+    ]
+    for i, tc in enumerate(tool_calls, 1):
+        args_str = json.dumps(tc.args, default=str)
+        lines.append(f"  [{i}] {tc.tool}({args_str})")
+        if tc.result_preview:
+            preview = tc.result_preview[:300]
+            lines.append(f"      → {preview}")
+    lines.append("-" * 72)
+    lines.append(f"  ANSWER: {answer[:300]}")
+    lines.append("=" * 72)
+    lines.append("")
+    print("\n".join(lines), file=sys.stderr, flush=True)
 
 
 __all__ = ["get_agent_deps", "router"]

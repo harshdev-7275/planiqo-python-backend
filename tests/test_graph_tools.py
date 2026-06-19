@@ -14,9 +14,9 @@ def _make_neo4j() -> Neo4jClient:
 
 
 class TestMakeGraphTools:
-    def test_returns_seven_tools(self) -> None:
+    def test_returns_eight_tools(self) -> None:
         tools = make_graph_tools(_make_neo4j(), "org-1")
-        assert len(tools) == 7
+        assert len(tools) == 8
 
     def test_tool_names_include_suggest_assignee(self) -> None:
         tools = make_graph_tools(_make_neo4j(), "org-1")
