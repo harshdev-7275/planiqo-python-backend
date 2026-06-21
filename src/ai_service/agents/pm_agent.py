@@ -11,6 +11,7 @@ LLM providers supported:
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 from langchain_core.language_models import BaseChatModel
@@ -247,6 +248,121 @@ async def arun_agent(
     )
 
 
+# ---------------------------------------------------------------------------
+# Streaming
+# ---------------------------------------------------------------------------
+
+# Cap on a tool's result preview so one huge payload doesn't blow up the SSE
+# frame. 200 chars matches the audit-trail preview used in the non-streaming chat.
+_TOOL_RESULT_PREVIEW_CHARS = 200
+
+
+def _content_to_str(content: Any) -> str:
+    """Coerce a LangChain message content value to a plain string.
+
+    Content can be a plain string (most LLM providers) or a list of content
+    blocks (multimodal messages). For streaming we only care about text — pull
+    the `text` field out of any dict block and concatenate.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                block_text = block.get("text")
+                if block_text is not None:
+                    parts.append(str(block_text))
+                    continue
+            parts.append(str(block))
+        return "".join(parts)
+    return str(content)
+
+
+async def astream_agent(
+    graph: Any,
+    message: str,
+    *,
+    org_id: str,
+    org_slug: str,
+    user_id: str,
+    project_id: str | None = None,
+    project_label: str | None = None,
+    history: list[BaseMessage] | None = None,
+    model: str = "",
+    callbacks: list[Any] | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Stream the agent's events for one turn.
+
+    Consumes ``graph.astream_events(..., version="v2")`` and yields normalized
+    event dicts the SSE endpoint can serialize:
+
+    - ``{"type": "token", "delta": "..."}`` — text deltas from the LLM.
+    - ``{"type": "tool_start", "tool": ..., "tool_call_id": ..., "args": ...}``
+    - ``{"type": "tool_end", "tool_call_id": ..., "result_preview": ...}``
+      — start/end events share a ``tool_call_id`` so the UI can pair them.
+    - ``{"type": "done", "message": ..., "tool_calls": [...], "model": ..., "steps": N}``
+      — emitted once after the stream completes; ``message`` is the
+      concatenation of every token delta, ``steps`` counts model invocations.
+
+    Reasoning blocks (``<think>...</think>``) are NOT filtered here — the SSE
+    endpoint owns the streaming-safe buffer. This function yields raw deltas.
+    """
+    state: AgentState = {
+        "messages": _seed_messages(message, history),
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "project_id": project_id,
+        "project_label": project_label,
+        "user_id": user_id,
+    }
+    config = _run_config(callbacks)
+
+    accumulated: str = ""
+    steps: int = 0
+
+    async for event in graph.astream_events(state, config=config, version="v2"):
+        kind = event.get("event")
+        data = event.get("data") or {}
+
+        if kind == "on_chat_model_start":
+            steps += 1
+        elif kind == "on_chat_model_stream":
+            chunk = data.get("chunk")
+            if chunk is not None:
+                delta = _content_to_str(getattr(chunk, "content", ""))
+                if delta:
+                    accumulated += delta
+                    yield {"type": "token", "delta": delta}
+        elif kind == "on_tool_start":
+            yield {
+                "type": "tool_start",
+                "tool": event.get("name", "unknown"),
+                "tool_call_id": str(event.get("run_id", "")),
+                "args": (data.get("input") or {}),
+            }
+        elif kind == "on_tool_end":
+            output = data.get("output")
+            preview: str | None = None
+            if output is not None:
+                preview = _content_to_str(output)
+                if len(preview) > _TOOL_RESULT_PREVIEW_CHARS:
+                    preview = preview[: _TOOL_RESULT_PREVIEW_CHARS - 1] + "…"
+            yield {
+                "type": "tool_end",
+                "tool_call_id": str(event.get("run_id", "")),
+                "result_preview": preview,
+            }
+
+    yield {
+        "type": "done",
+        "message": accumulated,
+        "tool_calls": [],
+        "model": model,
+        "steps": steps,
+    }
+
+
 # Module-level graph placeholder; tests should call build_graph with
 # a controlled list of tools and settings.
 _graph_cache: dict[Any, Any] = {}
@@ -289,6 +405,7 @@ def get_or_build_graph(
 __all__ = [
     "AgentState",
     "arun_agent",
+    "astream_agent",
     "build_graph",
     "build_llm",
     "get_or_build_graph",

@@ -7,15 +7,22 @@ the LangGraph message history.
 
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessage, HumanMessage, ToolCall, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolCall, ToolMessage
 
-from ai_service.api.chat import _strip_reasoning, get_agent_deps, router
+from ai_service.api.chat import (
+    StreamingReasoningFilter,
+    _strip_reasoning,
+    get_agent_deps,
+    router,
+)
 
 
 def _configured_settings_mock(app_env: str = "production") -> MagicMock:
@@ -557,3 +564,229 @@ class TestGetAgentDeps:
         with pytest.raises(HTTPException) as exc:
             get_agent_deps(request)
         assert exc.value.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# Streaming reasoning filter
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingReasoningFilter:
+    def test_strips_complete_think_block_in_single_chunk(self) -> None:
+        f = StreamingReasoningFilter()
+        assert f.feed("<think>reasoning</think>hello") == "hello"
+
+    def test_strips_think_block_split_across_multiple_feeds(self) -> None:
+        f = StreamingReasoningFilter()
+        assert f.feed("<think>rea") == ""
+        assert f.feed("soning</think>") == ""
+        assert f.feed("hello") == "hello"
+
+    def test_strips_multiple_think_blocks(self) -> None:
+        f = StreamingReasoningFilter()
+        assert f.feed("<think>a</think>one. <think>b</think>two.") == "one. two."
+
+    def test_holds_back_text_that_could_become_partial_open_tag(self) -> None:
+        # A trailing "<" could be the start of "<think>" — hold it back so it
+        # never leaks to the user. The next feed resolves it.
+        f = StreamingReasoningFilter()
+        assert f.feed("Hello ") == "Hello "
+        assert f.feed("<") == ""  # held back, could be "<think>" coming
+        # The "<" resolves into a think tag, the safe text is just "bar"
+        # (the "Hello " was already emitted in feed 1).
+        assert f.feed("think>foo</think>bar") == "bar"
+
+    def test_emits_trailing_text_when_no_think_block(self) -> None:
+        f = StreamingReasoningFilter()
+        assert f.feed("just text") == "just text"
+
+    def test_flush_emits_remaining_text_after_unclosed_think(self) -> None:
+        # Degenerate: the model never closed the think block. Strip the leading
+        # <think> tag (if present) so the user sees the intended answer, not
+        # raw reasoning — same fallback as _strip_reasoning.
+        f = StreamingReasoningFilter()
+        f.feed("<think>only reasoning")
+        assert f.flush() == "only reasoning"
+
+    def test_flush_emits_text_when_no_pending(self) -> None:
+        f = StreamingReasoningFilter()
+        assert f.flush() == ""
+
+    def test_case_insensitive_tag_match(self) -> None:
+        f = StreamingReasoningFilter()
+        assert f.feed("<THINK>foo</THINK>answer") == "answer"
+
+    def test_strips_leading_whitespace_from_first_safe_token(self) -> None:
+        # Reasoning models commonly emit "\n\n" right after their  block
+        # closes, before the actual reply. That leading whitespace must never
+        # reach the user — it shows up as a visible blank band above the text.
+        f = StreamingReasoningFilter()
+        assert f.feed("\n\nHey!") == "Hey!"
+
+    def test_strips_leading_whitespace_split_across_feeds(self) -> None:
+        # The leading "\n\n" can straddle two tokens ("\n" then "\nHey").
+        # The first feed must hold the whitespace back (no emit yet); the
+        # second feed resolves it and only "Hey" is emitted.
+        f = StreamingReasoningFilter()
+        assert f.feed("\n") == ""
+        assert f.feed("\nHey!") == "Hey!"
+
+    def test_does_not_strip_whitespace_inside_message(self) -> None:
+        # Interior newlines (paragraph breaks, lists, etc.) must be preserved
+        # — only the FIRST chunk's leading whitespace is dropped.
+        f = StreamingReasoningFilter()
+        assert f.feed("Hi there!\n\n- bullet 1\n- bullet 2") == "Hi there!\n\n- bullet 1\n- bullet 2"
+
+    def test_flush_strips_leading_whitespace(self) -> None:
+        # Buffer holds leading whitespace + a partial "<" opener that never
+        # resolves into a real  block. On flush, the leading
+        # whitespace is dropped so the user never sees a leading blank line.
+        f = StreamingReasoningFilter()
+        f.feed("\n  <")  # buffered: held back as a potential think-tag opener
+        assert f.flush() == "<"
+
+
+# ---------------------------------------------------------------------------
+# /v1/chat/stream — SSE endpoint
+# ---------------------------------------------------------------------------
+
+
+def _parse_sse_frames(body: str) -> list[dict[str, Any]]:
+    """Parse a `data: {...}\\n\\n` SSE body into a list of event dicts."""
+    frames: list[dict[str, Any]] = []
+    for chunk in body.split("\n\n"):
+        chunk = chunk.strip()
+        if chunk.startswith("data:"):
+            payload = chunk[len("data:"):].strip()
+            frames.append(json.loads(payload))
+    return frames
+
+
+class TestChatStreamEndpoint:
+    def test_streams_sse_frames_and_strips_think_tags_mid_stream(self) -> None:
+        """Token events become SSE frames; <think> blocks are stripped before emit."""
+        app = _build_app()
+
+        async def fake_astream_events(
+            *args: Any, **kwargs: Any
+        ) -> AsyncIterator[dict[str, Any]]:
+            # One model invocation → on_chat_model_start bumps `steps` to 1,
+            # then the streamed chunks are the two <think>-...-answer pieces.
+            yield {
+                "event": "on_chat_model_start",
+                "name": "agent",
+                "data": {},
+            }
+            yield {
+                "event": "on_chat_model_stream",
+                "name": "agent",
+                "data": {"chunk": AIMessageChunk(content="<think>reasoning")},
+            }
+            yield {
+                "event": "on_chat_model_stream",
+                "name": "agent",
+                "data": {"chunk": AIMessageChunk(content="</think>You have 28 open issues.")},
+            }
+
+        mock_graph = MagicMock()
+        mock_graph.astream_events = fake_astream_events
+
+        with (
+            patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
+            patch("ai_service.api.chat.get_or_build_graph", return_value=mock_graph),
+            TestClient(app) as client,
+        ):
+            response = client.post("/v1/chat/stream", json={"message": "list open issues"})
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert response.headers.get("x-accel-buffering") == "no"
+
+        frames = _parse_sse_frames(response.text)
+        token_deltas = [f["delta"] for f in frames if f.get("type") == "token"]
+        done = next((f for f in frames if f.get("type") == "done"), None)
+
+        # Reasoning must never reach the user.
+        full = "".join(token_deltas)
+        assert "reasoning" not in full
+        assert "<think>" not in full
+        assert "You have 28 open issues" in full
+
+        # Final frame carries the cleaned, accumulated message + model.
+        assert done is not None
+        assert done["message"] == "You have 28 open issues."
+        assert done["model"] == "groq:llama-3.3-70b-versatile"
+        assert done["steps"] == 1
+
+    def test_emits_tool_start_and_tool_end_frames(self) -> None:
+        """A tool call produces paired start/end SSE frames with matching tool_call_id."""
+        app = _build_app()
+
+        async def fake_astream_events(
+            *args: Any, **kwargs: Any
+        ) -> AsyncIterator[dict[str, Any]]:
+            yield {
+                "event": "on_tool_start",
+                "name": "list_issues",
+                "run_id": "t1",
+                "data": {"input": {"project_id": "p1"}},
+            }
+            yield {
+                "event": "on_tool_end",
+                "name": "list_issues",
+                "run_id": "t1",
+                "data": {"output": "result text"},
+            }
+            yield {
+                "event": "on_chat_model_stream",
+                "name": "agent",
+                "data": {"chunk": AIMessageChunk(content="done.")},
+            }
+
+        mock_graph = MagicMock()
+        mock_graph.astream_events = fake_astream_events
+
+        with (
+            patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
+            patch("ai_service.api.chat.get_or_build_graph", return_value=mock_graph),
+            TestClient(app) as client,
+        ):
+            response = client.post("/v1/chat/stream", json={"message": "hi"})
+
+        frames = _parse_sse_frames(response.text)
+        starts = [f for f in frames if f.get("type") == "tool_start"]
+        ends = [f for f in frames if f.get("type") == "tool_end"]
+        assert len(starts) == 1
+        assert starts[0]["tool"] == "list_issues"
+        assert starts[0]["args"] == {"project_id": "p1"}
+        assert len(ends) == 1
+        assert ends[0]["result_preview"] == "result text"
+        assert starts[0]["tool_call_id"] == ends[0]["tool_call_id"]
+
+    def test_emits_error_frame_on_graph_recursion_error(self) -> None:
+        """A GraphRecursionError surfaces as an `error` SSE frame, not a 502."""
+        from langgraph.errors import GraphRecursionError
+
+        app = _build_app()
+
+        async def fake_astream_events(
+            *args: Any, **kwargs: Any
+        ) -> AsyncIterator[dict[str, Any]]:
+            raise GraphRecursionError("loop")
+            yield  # pragma: no cover
+
+        mock_graph = MagicMock()
+        mock_graph.astream_events = fake_astream_events
+
+        with (
+            patch("ai_service.api.chat.get_settings", return_value=_configured_settings_mock()),
+            patch("ai_service.api.chat.get_or_build_graph", return_value=mock_graph),
+            TestClient(app) as client,
+        ):
+            response = client.post("/v1/chat/stream", json={"message": "hi"})
+
+        assert response.status_code == 200
+        frames = _parse_sse_frames(response.text)
+        errors = [f for f in frames if f.get("type") == "error"]
+        assert len(errors) == 1
+        assert errors[0]["code"] == "RECURSION_LIMIT"

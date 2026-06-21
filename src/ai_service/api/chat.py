@@ -1,7 +1,12 @@
-"""Chat endpoint — POST /v1/chat.
+"""Chat endpoint — POST /v1/chat (and POST /v1/chat/stream).
 
 Takes a user message, runs the PM agent (LangGraph), returns the answer
 + audit trail. Stateless per request in v1.
+
+The streaming variant emits Server-Sent Events (SSE) — `data: {...}\\n\\n`
+frames carrying token deltas, tool calls, the final answer, and any error.
+A streaming-safe filter strips ``<think>...</think>`` reasoning blocks
+mid-stream so they never reach the user.
 
 In `app_env == "development"` a single pretty-printed block is written to the
 console summarising the user query, every tool call (with args + a short
@@ -12,16 +17,20 @@ the structured JSON logs so log pipelines can ingest them.
 from __future__ import annotations
 
 import hmac
+import json
 import re
+from collections.abc import AsyncIterator
 from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
 
 from ai_service.agents import AgentDeps, get_or_build_graph
 from ai_service.agents.callbacks import ToolLoggingCallbackHandler
+from ai_service.agents.pm_agent import astream_agent
 from ai_service.agents.registry import get_agent_spec
 from ai_service.config import get_settings
 from ai_service.core.errors import ConfigurationError
@@ -367,7 +376,6 @@ def _dev_summary(
     model_id: str,
 ) -> None:
     """Pretty-print a request summary to the console (development only)."""
-    import json
     import sys
 
     lines = [
@@ -391,4 +399,299 @@ def _dev_summary(
     print("\n".join(lines), file=sys.stderr, flush=True)
 
 
-__all__ = ["get_agent_deps", "router"]
+# ---------------------------------------------------------------------------
+# Streaming — Server-Sent Events
+# ---------------------------------------------------------------------------
+
+_THINK_OPEN_PREFIXES: tuple[str, ...] = (
+    "<", "<t", "<th", "<thi", "<thin", "<think",
+)
+
+
+class StreamingReasoningFilter:
+    """Stateful filter that strips ``<think>...</think>`` blocks from a token stream.
+
+    Tokens arrive one at a time and a single ``<think>`` tag may straddle two
+    consecutive tokens (the model emits ``"<"`` then ``"think>..."``). The
+    filter maintains a small pending buffer; while outside a think block, any
+    text that could still become a ``<think>`` opener is held back so a stray
+    ``<`` is never emitted before the rest of the tag arrives.
+
+    Usage::
+
+        f = StreamingReasoningFilter()
+        for delta in stream:
+            safe = f.feed(delta)
+            if safe:
+                emit(safe)
+        tail = f.flush()           # any leftover after end-of-stream
+    """
+
+    def __init__(self) -> None:
+        self._in_think: bool = False
+        self._pending: str = ""
+        # Set the first time we emit safe text that contains a non-whitespace
+        # character. While False, leading whitespace runs at the start of safe
+        # text are dropped — reasoning models commonly emit "\n\n" right after
+        # their think block closes, before the actual reply, and we never want
+        # that to surface as a visible blank band in the chat bubble.
+        self._has_emitted_nonspace: bool = False
+
+    def feed(self, text: str) -> str:
+        """Consume one token chunk; return the text that's safe to emit now.
+
+        Empty string is a valid return — the caller should not emit anything
+        when the buffer is being held back. Multiple ``feed`` calls may be
+        needed to fully resolve a single think block.
+        """
+        self._pending += text
+        return self._drain()
+
+    def flush(self) -> str:
+        """Drain any remaining buffered text at end-of-stream.
+
+        If the model never closed a think block, the leading ``<think>`` tag
+        is stripped from the remaining text so the user sees the intended
+        answer, not raw reasoning — same fallback as ``_strip_reasoning``'s
+        "reasoning-only" behaviour.
+        """
+        out = self._pending
+        self._pending = ""
+        self._in_think = False
+        if out.lower().startswith("<think>"):
+            out = out[len("<think>"):]
+        return self._strip_leading_ws_if_first(out)
+
+    def _drain(self) -> str:
+        out_parts: list[str] = []
+        while self._pending:
+            if self._in_think:
+                idx = self._pending.lower().find("</think>")
+                if idx == -1:
+                    # Inside a think block, nothing to emit — keep waiting.
+                    break
+                # Drop the think block (and its closing tag) and continue
+                # draining whatever's after it.
+                self._pending = self._pending[idx + len("</think>"):]
+                self._in_think = False
+                continue
+
+            idx = self._pending.lower().find("<think>")
+            if idx == -1:
+                # No think block found. Hold back text that could still
+                # become a ``<think>`` opener at a token boundary.
+                if self._could_be_partial_open_tag():
+                    break
+                out_parts.append(self._pending)
+                self._pending = ""
+                break
+
+            # Emit everything before the think tag, then enter think mode.
+            out_parts.append(self._pending[:idx])
+            self._pending = self._pending[idx + len("<think>"):]
+            self._in_think = True
+            # Loop to keep draining the rest of the buffer.
+
+        return self._strip_leading_ws_if_first("".join(out_parts))
+
+    def _strip_leading_ws_if_first(self, text: str) -> str:
+        """Drop a leading whitespace run from the first non-empty safe emission.
+
+        Reasoning models commonly emit "\\n\\n" right after their think block
+        closes, before the actual reply. That leading whitespace must never
+        reach the user — it shows up as a visible blank band above the text.
+        Once we've emitted any non-whitespace safe text, interior whitespace
+        (paragraph breaks, lists, etc.) is preserved verbatim.
+        """
+        if self._has_emitted_nonspace or not text:
+            return text
+        stripped = text.lstrip()
+        if stripped:
+            self._has_emitted_nonspace = True
+        return stripped
+
+    def _could_be_partial_open_tag(self) -> bool:
+        lower = self._pending.lower()
+        return any(lower.endswith(p) for p in _THINK_OPEN_PREFIXES)
+
+
+def _sse_frame(event_type: str, data: dict[str, Any]) -> bytes:
+    """Build an SSE frame: ``data: {json}\\n\\n``."""
+    payload: dict[str, Any] = {"type": event_type, **data}
+    return f"data: {json.dumps(payload)}\n\n".encode("utf-8")
+
+
+@router.post(
+    "/chat/stream",
+    status_code=status.HTTP_200_OK,
+    summary="Stream chat with the PM agent (SSE)",
+    description=(
+        "Server-Sent Events stream of the agent's response. Each frame is a "
+        "JSON object on a `data:` line. Event types: `token` (incremental "
+        "answer text), `tool_start` (model invoked a tool), `tool_end` (tool "
+        "returned), `done` (final message + audit summary), `error` (the "
+        "run failed). `<think>...</think>` reasoning blocks are stripped "
+        "mid-stream and never reach the client."
+    ),
+)
+async def chat_stream(
+    request: Request,
+    body: ChatRequest,
+    deps: AgentDeps = Depends(get_agent_deps),
+) -> StreamingResponse:
+    """Stream the PM agent's response as SSE.
+
+    Same auth, agent selection, and project scoping as ``POST /v1/chat``.
+    The body of the response is a sequence of ``data: {...}\\n\\n`` frames;
+    see the OpenAPI docstring for the event types.
+    """
+    settings = get_settings()
+
+    if not settings.llm_configured:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"LLM provider {settings.llm_provider!r} is not configured. "
+                f"Set the corresponding API key in env."
+            ),
+        )
+
+    try:
+        spec = get_agent_spec(body.agent)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+
+    project_id_str: str | None = None
+    project_label: str | None = None
+    if body.project_id is not None:
+        deps.project_id = body.project_id
+        project_id_str = str(body.project_id)
+        project_label = await _resolve_project_label(deps, body.project_id)
+
+    logger.info(
+        "chat.stream.request",
+        extra={
+            "agent": body.agent or "pm",
+            "message_chars": len(body.message),
+            "project_id": project_id_str,
+            "project_label": project_label,
+            "org_slug": deps.org_slug,
+            "org_id": str(deps.org_id),
+            "user_id": str(deps.user_id),
+            "history_turns": len(body.history),
+        },
+    )
+
+    neo4j_client = getattr(request.app.state, "neo4j", None)
+    tools = spec.select_tools(
+        deps.node_backend,
+        deps.org_slug,
+        neo4j_client=neo4j_client,
+        org_id=str(deps.org_id),
+        scoped_project_id=project_id_str,
+    )
+    graph = get_or_build_graph(tools, settings, spec=spec, scoped_project_id=project_id_str)
+
+    model_id = (
+        settings.llm_provider
+        + ":"
+        + (settings.groq_model if settings.llm_provider == "groq" else settings.minimax_model)
+    )
+
+    history = _history_to_messages(body.history)
+
+    async def event_generator() -> AsyncIterator[bytes]:
+        reasoning_filter = StreamingReasoningFilter()
+        # Track the safe (filter-stripped) accumulated text so the final `done`
+        # event carries the cleaned message — `astream_agent`'s `done.message`
+        # is the raw concatenation of every token delta, which includes any
+        # <think>...</think> content the model emitted.
+        accumulated_safe: str = ""
+        try:
+            async for event in astream_agent(
+                graph,
+                body.message,
+                org_id=str(deps.org_id),
+                org_slug=deps.org_slug,
+                user_id=str(deps.user_id),
+                project_id=project_id_str,
+                project_label=project_label,
+                history=history,
+                model=model_id,
+            ):
+                kind = event.get("type")
+                if kind == "token":
+                    safe = reasoning_filter.feed(str(event.get("delta", "")))
+                    if safe:
+                        accumulated_safe += safe
+                        yield _sse_frame("token", {"delta": safe})
+                elif kind == "tool_start":
+                    yield _sse_frame(
+                        "tool_start",
+                        {
+                            "tool": event.get("tool"),
+                            "tool_call_id": event.get("tool_call_id"),
+                            "args": event.get("args", {}),
+                        },
+                    )
+                elif kind == "tool_end":
+                    yield _sse_frame(
+                        "tool_end",
+                        {
+                            "tool_call_id": event.get("tool_call_id"),
+                            "result_preview": event.get("result_preview"),
+                        },
+                    )
+                elif kind == "done":
+                    # Flush any pending text the filter was holding back.
+                    tail = reasoning_filter.flush()
+                    if tail:
+                        accumulated_safe += tail
+                        yield _sse_frame("token", {"delta": tail})
+                    yield _sse_frame(
+                        "done",
+                        {
+                            "message": accumulated_safe,
+                            "tool_calls": event.get("tool_calls", []),
+                            "model": event.get("model", ""),
+                            "steps": event.get("steps", 0),
+                        },
+                    )
+        except GraphRecursionError:
+            logger.warning(
+                "chat.stream.recursion_limit",
+                extra={"message_preview": body.message[:80]},
+            )
+            yield _sse_frame(
+                "error",
+                {
+                    "code": "RECURSION_LIMIT",
+                    "message": (
+                        "I wasn't able to finish that one — try narrowing it down "
+                        "(name a specific project or issue)."
+                    ),
+                },
+            )
+        except Exception:
+            logger.exception("chat.stream.error", extra={"message_preview": body.message[:80]})
+            yield _sse_frame(
+                "error",
+                {
+                    "code": "INTERNAL_ERROR",
+                    "message": "The agent failed to process the request. Try again or rephrase.",
+                },
+            )
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+__all__ = ["StreamingReasoningFilter", "get_agent_deps", "router"]
