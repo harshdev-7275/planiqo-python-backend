@@ -616,6 +616,35 @@ class TestStreamingReasoningFilter:
         f = StreamingReasoningFilter()
         assert f.feed("<THINK>foo</THINK>answer") == "answer"
 
+    def test_strips_leading_whitespace_from_first_safe_token(self) -> None:
+        # Reasoning models commonly emit "\n\n" right after their  block
+        # closes, before the actual reply. That leading whitespace must never
+        # reach the user — it shows up as a visible blank band above the text.
+        f = StreamingReasoningFilter()
+        assert f.feed("\n\nHey!") == "Hey!"
+
+    def test_strips_leading_whitespace_split_across_feeds(self) -> None:
+        # The leading "\n\n" can straddle two tokens ("\n" then "\nHey").
+        # The first feed must hold the whitespace back (no emit yet); the
+        # second feed resolves it and only "Hey" is emitted.
+        f = StreamingReasoningFilter()
+        assert f.feed("\n") == ""
+        assert f.feed("\nHey!") == "Hey!"
+
+    def test_does_not_strip_whitespace_inside_message(self) -> None:
+        # Interior newlines (paragraph breaks, lists, etc.) must be preserved
+        # — only the FIRST chunk's leading whitespace is dropped.
+        f = StreamingReasoningFilter()
+        assert f.feed("Hi there!\n\n- bullet 1\n- bullet 2") == "Hi there!\n\n- bullet 1\n- bullet 2"
+
+    def test_flush_strips_leading_whitespace(self) -> None:
+        # Buffer holds leading whitespace + a partial "<" opener that never
+        # resolves into a real  block. On flush, the leading
+        # whitespace is dropped so the user never sees a leading blank line.
+        f = StreamingReasoningFilter()
+        f.feed("\n  <")  # buffered: held back as a potential think-tag opener
+        assert f.flush() == "<"
+
 
 # ---------------------------------------------------------------------------
 # /v1/chat/stream — SSE endpoint

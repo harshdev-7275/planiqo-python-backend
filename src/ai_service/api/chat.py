@@ -430,6 +430,12 @@ class StreamingReasoningFilter:
     def __init__(self) -> None:
         self._in_think: bool = False
         self._pending: str = ""
+        # Set the first time we emit safe text that contains a non-whitespace
+        # character. While False, leading whitespace runs at the start of safe
+        # text are dropped — reasoning models commonly emit "\n\n" right after
+        # their think block closes, before the actual reply, and we never want
+        # that to surface as a visible blank band in the chat bubble.
+        self._has_emitted_nonspace: bool = False
 
     def feed(self, text: str) -> str:
         """Consume one token chunk; return the text that's safe to emit now.
@@ -454,7 +460,7 @@ class StreamingReasoningFilter:
         self._in_think = False
         if out.lower().startswith("<think>"):
             out = out[len("<think>"):]
-        return out
+        return self._strip_leading_ws_if_first(out)
 
     def _drain(self) -> str:
         out_parts: list[str] = []
@@ -486,7 +492,23 @@ class StreamingReasoningFilter:
             self._in_think = True
             # Loop to keep draining the rest of the buffer.
 
-        return "".join(out_parts)
+        return self._strip_leading_ws_if_first("".join(out_parts))
+
+    def _strip_leading_ws_if_first(self, text: str) -> str:
+        """Drop a leading whitespace run from the first non-empty safe emission.
+
+        Reasoning models commonly emit "\\n\\n" right after their think block
+        closes, before the actual reply. That leading whitespace must never
+        reach the user — it shows up as a visible blank band above the text.
+        Once we've emitted any non-whitespace safe text, interior whitespace
+        (paragraph breaks, lists, etc.) is preserved verbatim.
+        """
+        if self._has_emitted_nonspace or not text:
+            return text
+        stripped = text.lstrip()
+        if stripped:
+            self._has_emitted_nonspace = True
+        return stripped
 
     def _could_be_partial_open_tag(self) -> bool:
         lower = self._pending.lower()
