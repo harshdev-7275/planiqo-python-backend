@@ -515,6 +515,92 @@ class StreamingReasoningFilter:
         return any(lower.endswith(p) for p in _THINK_OPEN_PREFIXES)
 
 
+_SUGG_MARKER = "<!--SUGGESTIONS:"
+_SUGG_END    = "-->"
+# We need to hold back up to (marker_length - 1) chars so a partial marker
+# arriving across token boundaries is never prematurely emitted.
+_SUGG_HOLD   = len(_SUGG_MARKER) - 1
+
+
+class SuggestionsFilter:
+    """Strips the ``<!--SUGGESTIONS:[...]-->`` block from the token stream.
+
+    The block is appended by the PM agent at the very end of every response so
+    the frontend can show contextual follow-up chips without a second LLM call.
+    This filter intercepts it mid-stream so the raw marker never reaches the
+    user's chat bubble.
+
+    Usage (mirrors StreamingReasoningFilter)::
+
+        f = SuggestionsFilter()
+        for delta in stream:
+            safe = f.feed(delta)   # emit safe; suppress suggestions block
+            if safe:
+                emit(safe)
+        leftover, items = f.flush()  # items = parsed suggestion list
+    """
+
+    def __init__(self) -> None:
+        self._capturing: bool = False  # True once marker start is found
+        self._pending:   str  = ""     # holds chars that might be start of marker
+        self._captured:  str  = ""     # accumulates content inside the block
+
+    def feed(self, text: str) -> str:
+        """Return text that's safe to display; suppress the suggestions block."""
+        if self._capturing:
+            self._captured += text
+            return ""
+
+        self._pending += text
+
+        idx = self._pending.find(_SUGG_MARKER)
+        if idx != -1:
+            safe = self._pending[:idx]
+            self._captured = self._pending[idx + len(_SUGG_MARKER):]
+            self._pending  = ""
+            self._capturing = True
+            return safe
+
+        # Hold back up to _SUGG_HOLD chars if they could be start of marker.
+        for hold in range(min(_SUGG_HOLD, len(self._pending)), 0, -1):
+            if _SUGG_MARKER.startswith(self._pending[-hold:]):
+                safe = self._pending[:-hold]
+                self._pending = self._pending[-hold:]
+                return safe
+
+        safe = self._pending
+        self._pending = ""
+        return safe
+
+    def flush(self) -> tuple[str, list[dict[str, Any]]]:
+        """Drain remaining buffer. Returns (leftover_display_text, suggestions).
+
+        ``suggestions`` is a list of ``{"label": str, "prompt": str}`` dicts.
+        Returns an empty list if the block is absent or malformed.
+        """
+        if not self._capturing:
+            leftover = self._pending
+            self._pending = ""
+            return leftover, []
+
+        raw = self._captured
+        self._capturing = False
+        self._captured  = ""
+
+        end = raw.find(_SUGG_END)
+        if end == -1:
+            return "", []
+
+        json_str = raw[:end].strip()
+        try:
+            items = json.loads(json_str)
+            if isinstance(items, list):
+                return "", items[:4]
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return "", []
+
+
 def _sse_frame(event_type: str, data: dict[str, Any]) -> bytes:
     """Build an SSE frame: ``data: {json}\\n\\n``."""
     payload: dict[str, Any] = {"type": event_type, **data}
@@ -603,7 +689,8 @@ async def chat_stream(
     history = _history_to_messages(body.history)
 
     async def event_generator() -> AsyncIterator[bytes]:
-        reasoning_filter = StreamingReasoningFilter()
+        reasoning_filter   = StreamingReasoningFilter()
+        suggestions_filter = SuggestionsFilter()
         # Track the safe (filter-stripped) accumulated text so the final `done`
         # event carries the cleaned message — `astream_agent`'s `done.message`
         # is the raw concatenation of every token delta, which includes any
@@ -623,10 +710,12 @@ async def chat_stream(
             ):
                 kind = event.get("type")
                 if kind == "token":
-                    safe = reasoning_filter.feed(str(event.get("delta", "")))
-                    if safe:
-                        accumulated_safe += safe
-                        yield _sse_frame("token", {"delta": safe})
+                    # Reasoning filter first, then suggestions filter.
+                    after_reasoning = reasoning_filter.feed(str(event.get("delta", "")))
+                    display = suggestions_filter.feed(after_reasoning)
+                    if display:
+                        accumulated_safe += display
+                        yield _sse_frame("token", {"delta": display})
                 elif kind == "tool_start":
                     yield _sse_frame(
                         "tool_start",
@@ -647,11 +736,24 @@ async def chat_stream(
                 elif kind == "status":
                     yield _sse_frame("status", {"message": event.get("message", "")})
                 elif kind == "done":
-                    # Flush any pending text the filter was holding back.
-                    tail = reasoning_filter.flush()
-                    if tail:
-                        accumulated_safe += tail
-                        yield _sse_frame("token", {"delta": tail})
+                    # 1. Flush reasoning filter → feed remainder through suggestions filter.
+                    reasoning_tail = reasoning_filter.flush()
+                    display_tail   = suggestions_filter.feed(reasoning_tail)
+                    if display_tail:
+                        accumulated_safe += display_tail
+                        yield _sse_frame("token", {"delta": display_tail})
+
+                    # 2. Flush suggestions filter → extract chips + any leftover text.
+                    leftover, suggestion_items = suggestions_filter.flush()
+                    if leftover:
+                        accumulated_safe += leftover
+                        yield _sse_frame("token", {"delta": leftover})
+
+                    # 3. Emit suggestions frame before done so the frontend can show
+                    #    chips immediately as the `done` event fires.
+                    if suggestion_items:
+                        yield _sse_frame("suggestions", {"suggestions": suggestion_items})
+
                     yield _sse_frame(
                         "done",
                         {
@@ -696,4 +798,4 @@ async def chat_stream(
     )
 
 
-__all__ = ["StreamingReasoningFilter", "get_agent_deps", "router"]
+__all__ = ["StreamingReasoningFilter", "SuggestionsFilter", "get_agent_deps", "router"]

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
-from ai_service.api import chat, graph_routes, health, neo4j_routes
+from ai_service.api import chat, graph_routes, health, neo4j_routes, suggestions
 from ai_service.config import Settings, get_settings
 from ai_service.schemas import ServiceInfoResponse
 
@@ -16,6 +16,7 @@ api_router.include_router(health.router)
 api_router.include_router(neo4j_routes.router)
 api_router.include_router(chat.router)
 api_router.include_router(graph_routes.router)
+api_router.include_router(suggestions.router)
 
 
 @api_router.get(

@@ -88,6 +88,19 @@ Responses are rendered as **Markdown** in the chat UI. Use structure to aid scan
 - Keep answers under ~300 words unless the user explicitly asked for a detailed report.
 - Never echo raw JSON, Cypher queries, or internal tool names to the user.
 - Blank line between every block element (paragraphs, lists, tables, headers) so the Markdown parser renders them correctly.
+
+### Follow-up suggestions (MANDATORY)
+
+After EVERY response, on its own line at the very end, append exactly this block — **never omit it, never show it in prose**:
+
+<!--SUGGESTIONS:[{"label":"<max 5 words>","prompt":"<full question, max 60 words>"},{"label":"...","prompt":"..."},{"label":"...","prompt":"..."},{"label":"...","prompt":"..."}]-->
+
+Rules for the 4 suggestions:
+- Directly related to what you just answered (drill into the data you returned)
+- Varied angles: one drill-down, one action, one comparison or trend, one "what if"
+- Specific — use project names, issue codes, or user names from your answer when relevant
+- Never repeat the user's original question
+- The block must be valid JSON — no trailing commas, no single quotes
 """
 
 
