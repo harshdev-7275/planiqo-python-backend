@@ -644,6 +644,8 @@ async def chat_stream(
                             "result_preview": event.get("result_preview"),
                         },
                     )
+                elif kind == "status":
+                    yield _sse_frame("status", {"message": event.get("message", "")})
                 elif kind == "done":
                     # Flush any pending text the filter was holding back.
                     tail = reasoning_filter.flush()

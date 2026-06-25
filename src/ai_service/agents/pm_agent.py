@@ -321,6 +321,11 @@ async def astream_agent(
     accumulated: str = ""
     steps: int = 0
 
+    # Emit immediately so the UI can show a "Thinking…" indicator before the
+    # first token or tool call arrives — the gap between request receipt and
+    # the first LLM round-trip can be several seconds.
+    yield {"type": "status", "message": "Thinking…"}
+
     async for event in graph.astream_events(state, config=config, version="v2"):
         kind = event.get("event")
         data = event.get("data") or {}
@@ -353,6 +358,11 @@ async def astream_agent(
                 "tool_call_id": str(event.get("run_id", "")),
                 "result_preview": preview,
             }
+            # After a tool returns the model re-enters its reasoning loop.
+            # Surface this to the UI so the user sees "Analyzing results…"
+            # instead of a silent pause between the chip settling and the
+            # next token (or next tool call) arriving.
+            yield {"type": "status", "message": "Analyzing results…"}
 
     yield {
         "type": "done",
