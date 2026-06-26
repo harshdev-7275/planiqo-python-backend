@@ -23,6 +23,31 @@ class GraphProjectSyncRequest(BaseModel):
     project_id: UUID = Field(..., description="Project UUID to sync.")
 
 
+class SlackSyncRequest(BaseModel):
+    """Body for POST /v1/graph/sync/slack — full-org Slack re-sync."""
+
+    org_slug: str = Field(..., min_length=1, description="Organisation URL slug.")
+    org_id: str = Field(..., min_length=1, description="Organisation UUID.")
+
+
+class SlackChannelSyncRequest(BaseModel):
+    """Body for POST /v1/graph/sync/slack/channel/:channelId — incremental channel sync."""
+
+    org_slug: str = Field(..., min_length=1, description="Organisation URL slug.")
+    org_id: str = Field(..., min_length=1, description="Organisation UUID.")
+    channel_id: UUID = Field(..., description="Slack channel UUID to sync.")
+
+
+class SlackSyncAck(BaseModel):
+    """Acknowledgement returned by the Phase 0+1 stub. The actual
+    SlackSyncService lands in Phase 2 — for now the endpoint just records
+    the trigger and returns 200 so node-backend's kg_sync_log row closes."""
+
+    status:     str = "accepted"
+    org_id:     str
+    channel_id: str | None = None
+
+
 class GraphSyncResponse(BaseModel):
     """Stats returned after a sync run."""
 
@@ -48,4 +73,7 @@ __all__ = [
     "GraphStatsResponse",
     "GraphSyncRequest",
     "GraphSyncResponse",
+    "SlackChannelSyncRequest",
+    "SlackSyncAck",
+    "SlackSyncRequest",
 ]

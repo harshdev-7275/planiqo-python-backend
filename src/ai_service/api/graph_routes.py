@@ -26,6 +26,9 @@ from ai_service.schemas.graph import (
     GraphStatsResponse,
     GraphSyncRequest,
     GraphSyncResponse,
+    SlackChannelSyncRequest,
+    SlackSyncAck,
+    SlackSyncRequest,
 )
 
 logger = get_logger(__name__)
@@ -118,6 +121,52 @@ async def sync_project(
         ) from None
 
     return GraphSyncResponse(**stats.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# Slack sync stubs (Phase 0+1)
+#
+# Real SlackSyncService lands in Phase 2 (graph/chat_sync.py + SlackMessage
+# nodes + hybrid retrieval). For now the endpoints just acknowledge the
+# trigger so node-backend's kg_sync_log row closes — the same retry contract
+# applies. Phase 2 will replace the body of these handlers with the actual
+# sync. Both require either a service-to-service token or a user JWT, just
+# like the existing sync endpoints.
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/sync/slack",
+    response_model=SlackSyncAck,
+    status_code=status.HTTP_200_OK,
+    summary="Slack full-org sync (stub)",
+    description=(
+        "Phase 0+1 stub — acknowledges the trigger so node-backend's "
+        "kg_sync_log row closes. Real SlackSyncService arrives in Phase 2."
+    ),
+)
+async def sync_slack_org(body: SlackSyncRequest) -> SlackSyncAck:
+    logger.info("graph.sync.slack.stub", extra={"org_id": body.org_id})
+    return SlackSyncAck(status="accepted", org_id=body.org_id, channel_id=None)
+
+
+@router.post(
+    "/sync/slack/channel/{channel_id}",
+    response_model=SlackSyncAck,
+    status_code=status.HTTP_200_OK,
+    summary="Slack channel sync (stub)",
+    description=(
+        "Phase 0+1 stub for a single Slack channel. The actual sync that "
+        "pulls messages from node-backend, embeds them, and MERGE-writes "
+        "SlackMessage nodes is Phase 2."
+    ),
+)
+async def sync_slack_channel(channel_id: UUID, body: SlackChannelSyncRequest) -> SlackSyncAck:
+    logger.info(
+        "graph.sync.slack.channel.stub",
+        extra={"org_id": body.org_id, "channel_id": str(channel_id)},
+    )
+    return SlackSyncAck(status="accepted", org_id=body.org_id, channel_id=str(channel_id))
 
 
 @router.get(
